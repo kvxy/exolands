@@ -1,0 +1,15 @@
+{
+  "name": "exolands",
+  "version": "0.0.1",
+  "description": "web voxel game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.1"
+  },
+  "engines": {
+    "node": "12.x"
+  }
+}
