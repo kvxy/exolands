@@ -1,5 +1,6 @@
-function Controls(keymap) {
-  this.keymap = keymap || {
+function initControls() {
+  
+  let keymap = {
     87: 'forward', // w
     83: 'back',    // s
     65: 'left',    // a
@@ -8,20 +9,49 @@ function Controls(keymap) {
     16: 'down',    // shift
     17: 'lock'     // ctrl
   };
-  this.input = Object.fromEntries(Object.entries(this.keymap).map(a => [a[1], false]));
-
-  this.mousemove = e => {};
-  this.mousedown = e => {};
-
+  let input = Object.fromEntries(Object.entries(keymap).map(a => [a[1], false]));
+  
+  sim.world.player.tick = function() {    
+    const speed = 0.05;
+    let vx = vy = vz = 0;
+    if (input.forward) vz -= speed;
+    if (input.back) vz += speed;
+    if (input.up) vy += speed;
+    if (input.down) vy -= speed;
+    if (input.left) vx -= speed;
+    if (input.right) vx += speed;
+        
+    this.moveX(vx);
+    this.moveY(vy);
+    this.moveZ(vz);
+  };
+  
   // event listeners
-  window.addEventListener('mousemove', e => this.mousemove(e));
-  window.addEventListener('mousedown', e => this.mousedown(e));
+  window.addEventListener('mousemove', e => {
+    if (document.pointerLockElement !== null) {
+      let rot = sim.world.player.rotation;
+      rot[1] -= e.movementX / 500;
+      rot[0] += e.movementY / 500;
+      if (rot[0] > Math.PI / 2) rot[0] = Math.PI / 2;
+      if (rot[0] < -Math.PI / 2) rot[0] = -Math.PI / 2;
+    }
+  });
+  
+  window.addEventListener('mousedown', e => {
+    if (event.button === 2) {
+      sim.world.player.placeBlock();
+    } else if (event.button === 0) {
+      sim.world.player.breakBlock();
+    }
+  });
 
   window.addEventListener('keydown', () => {
-    this.input[this.keymap[event.keyCode]] = true;
-    if (this.input.lock) document.getElementById('glcanvas').requestPointerLock();
+    input[keymap[event.keyCode]] = true;
+    if (input.lock) document.getElementById('glcanvas').requestPointerLock();
   });
+  
   window.addEventListener('keyup', () => {
-    this.input[this.keymap[event.keyCode]] = false;
+    input[keymap[event.keyCode]] = false;
   });
-}
+ 
+};

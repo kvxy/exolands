@@ -35,7 +35,8 @@ Generator.prototype.generateChunk = function(x, y, z) {
     let p = Chunk.indexToPos(i);
     let height = noiseMap[p[0]][p[2]];
     let bheight = p[1] + y * 32;
-    
+    //blocks[i] = p[0] >= 8 && p[0] < 24 && p[1] === 1 && p[2] >= 8 && p[2] < 24 ? ((p[0] + p[1] + p[2]) % 2 === 0 ? 7 : 9) : 0;
+    //blocks[i] = p[0] >= 8 && p[0] < 24 && p[1] >= 8 && p[1] < 24 && p[2] >= 8 && p[2] < 24 ? ((p[0] + p[1] + p[2]) % 2 === 0 ? 7 : 9) : 0;
     blocks[i] = (bheight < height - 2) ? 1 : (bheight < height - 1) ? (Math.random() < 0.3 ? 1 : 2) : (bheight < height) ? 2 : (bheight === height) ? 3 : 0;
   }
   /*
