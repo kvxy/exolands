@@ -42,6 +42,7 @@ Renderer.prototype.assignAttribI = function(name, buffer, size, type, stride, of
   gl.vertexAttribIPointer(loc, size, type, false, stride, offset);
 };
 
+/*
 Renderer.prototype.createTexture = function(url) {
   const gl = this.gl,
         texture = gl.createTexture();
@@ -87,4 +88,4 @@ Renderer.prototype.createTextureArray = async function(urls, width, height) {
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST_MIPMAP_LINEAR);
   return texture;
-};
+};*/
