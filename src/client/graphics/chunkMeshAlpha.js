@@ -2,90 +2,115 @@ extend(ChunkMeshAlpha, ChunkMesh);
 function ChunkMeshAlpha(...args) {
   this.__super__.constructor.call(this, ...args);
   
-  // stores indices in each block coordinate
-  // eg data at (x: 5, y: 6, z: 7) is stored in as blocksX[5][6][7] and blocksY[6][7][5] and blocksZ[7][5][6]
+  // stores indices in each block coordinate for easy iteration
   this.blocksX = [];
   this.blocksY = [];
   this.blocksZ = [];
-  this.indicesLength = 0;
+  this.blocksData = {};
   
-  // checks relevant changes in camera
-  this.changes = { x: NaN, y: NaN, z: NaN, greatestDir: '' };
+  this.indices = [];
+  this.indicesLength = 0;
 }
 
-ChunkMeshAlpha.prototype.makeIndicesIterator = function*(x, y, z, vx, vy, vz) {
-  const avx = Math.abs(vx),
+ChunkMeshAlpha.prototype.updateBuffers = function() {
+  const gl = this.gl;
+  gl.bindVertexArray(this.vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, this.vertex0Buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Uint32Array(this.vertex0), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, this.vertex1Buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Uint32Array(this.vertex1), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, this.indices, gl.DYNAMIC_DRAW);  
+  delete this.indices;
+};
+
+ChunkMeshAlpha.changes = { x: NaN, y: NaN, z: NaN, greatestDir: '' };
+ChunkMeshAlpha.processCameraData = function(camera) {
+  const x = Math.floor(camera.x),
+        y = Math.floor(camera.y),
+        z = Math.floor(camera.z),
+        rx = camera.rotation[0],
+        ry = camera.rotation[1],
+        vx = Math.sin(ry) * Math.cos(rx),
+        vy = Math.sin(rx),
+        vz = Math.cos(ry) * Math.cos(rx),
+        avx = Math.abs(vx),
         avy = Math.abs(vy),
         avz = Math.abs(vz),
         greatestDir = (avx > avy ? (avx > avz ? 'X' : 'Z') : (avy > avz ? 'Y' : 'Z')),
-        greatestMag = greatestDir === 'X' ? vx : greatestDir === 'Y' ? vy : vz,
-        blocksPos = this['blocks' + greatestDir],
-        otherPos = greatestDir === 'X' ? [ y, z ] : greatestDir === 'Y' ? [ z, x ] : [ x, y ];
-  x = Math.floor(x);
-  y = Math.floor(y);
-  z = Math.floor(z);
+        greatestMag = greatestDir === 'X' ? vx : greatestDir === 'Y' ? vy : vz;
   
   // ONLY UPDATE WHEN: camera's block position changes OR camera rotatation that results in a change in greatest direction
   const changes = this.changes;
-  if ((x - changes.x) === 0 && (y - changes.y) === 0 && (z - changes.z) !== 0 && changes.greatestDir === greatestDir) return -1;
+  let changed = true;
+  if (x === changes.x && y === changes.y && z === changes.z && changes.greatestDir === greatestDir) changed = false;
   changes.x = x;
   changes.y = y;
   changes.z = z;
   changes.greatestDir = greatestDir;
   
-  let i, j, k, l, indices, r0, r1;
-  // loop from back to front in greatest 'v' direction's magnitude
-  if ((!blocksPos.reversed && greatestMag < 0) || (blocksPos.reversed && greatestMag >= 0)) {
-    blocksPos.reverse();
-    blocksPos.reversed = !blocksPos.reversed;
-  }
-  for (i in blocksPos) {
-    // loop based on rectilinear distance
-    r0 = 0;
-    while (r0++ < 2) {
-      for (j in blocksPos[i]) {
-        if (blocksPos[i].reversed ? (+j <= otherPos[1]) : (+j > otherPos[1])) break;
-        r1 = 0;
-        while (r1++ < 2) {
-          for (k in blocksPos[i][j]) {
-            if (blocksPos[i][j].reversed ? (+k <= otherPos[1]) : (+k > otherPos[1])) break;
-            for (l in blocksPos[i][j][k]) {
-              yield blocksPos[i][j][k][l];
-            }
-          }
-          blocksPos[i][j].reverse();
-          blocksPos[i][j].reversed = !blocksPos[i][j].reversed;
-        }
-      }
-      blocksPos[i].reverse();
-      blocksPos[i].reversed = !blocksPos[i][j].reversed;
-    }
-  }
-  
+  return [ x, y, z, greatestDir, greatestMag, changed ];
 };
 
-ChunkMeshAlpha.prototype.updateIndices = function(camera) {
-  const rx = camera.rotation[0],
-        ry = camera.rotation[1],
-        vx = Math.sin(ry) * Math.cos(rx),
-        vy = Math.sin(rx),
-        vz = Math.cos(ry) * Math.cos(rx);
+ChunkMeshAlpha.prototype.updateIndices = function(x, y, z, greatestDir, greatestMag, changed) {
+  if (!changed && !this.update) return;
   
-  const indicesIterator = this.makeIndicesIterator(camera.x, camera.y, camera.z, vx, vy, vz);
-  if (indicesIterator === -1) return;
+  const blocksPos = this['blocks' + greatestDir],
+        otherPos = greatestDir === 'X' ? [ y - this.y * 32, z - this.z * 32 ] : greatestDir === 'Y' ? [ z - this.z * 32, x - this.x * 32 ] : [ x - this.x * 32, y - this.y * 32 ];  
   
-  this.indices = this.indicesIterator();
-  this.indices.length = this.indicesLength;
+  this.indices = new Uint32Array(this.indicesLength);
+  let i, j, k, l, index = 0;
+  // loop from back to front in greatest 'v' direction's magnitude
+  let reversed = false;
+  if (greatestMag < 0) {
+    blocksPos.reverse();
+    reversed = true;
+  }
+  for (i = 0; i < blocksPos.length; i ++) {
+    // loop based on rectilinear distance
+    for (j = 1; j < blocksPos[i].length; j ++) {
+      if (blocksPos[i][j][0] >= otherPos[0]) break;
+      for (k = 1; k < blocksPos[i][j].length; k ++) {
+        if (blocksPos[i][j][k][0] >= otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+      for (k = blocksPos[i][j].length - 1; k >= 1; k --) {
+        if (blocksPos[i][j][k][0] < otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+    }
+    for (j = blocksPos[i].length - 1; j >= 1; j --) {
+      if (blocksPos[i][j][0] < otherPos[0]) break;
+      for (k = 1; k < blocksPos[i][j].length; k ++) {
+        if (blocksPos[i][j][k][0] >= otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+      for (k = blocksPos[i][j].length - 1; k >= 1; k --) {
+        if (blocksPos[i][j][k][0] < otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+    }
+  }
+  if (reversed) blocksPos.reverse();
   
-  // update indices buffer
+  if (this.update) return;
   const gl = this.gl;
   gl.bindVertexArray(this.vao);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(this.indices), gl.DYNAMIC_DRAW);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, this.indices, gl.DYNAMIC_DRAW);
+  delete this.indices;
 };
 
 ChunkMeshAlpha.prototype.updateBlocksPos = function(x, y, z, add, indices) {
-  let p, 
+  let p, i, j, k,
       bp0, bp1, bp2, // x/y/z, y/z/x, z/x/y
       blocksPos;     // X,     Y,     Z
   for (p = 0; p < 3; p ++) {
@@ -93,23 +118,37 @@ ChunkMeshAlpha.prototype.updateBlocksPos = function(x, y, z, add, indices) {
     bp1 = p === 0 ? y : p === 1 ? z : x;
     bp2 = p === 0 ? z : p === 1 ? x : y;
     blocksPos = this['blocks' + 'XYZ'[p]];
+    
+    for (i = 0; i < blocksPos.length; i ++) {
+      if (bp0 <= blocksPos[i][0]) break;
+    }
+    if (add && bp0 !== blocksPos[i]?.[0]) blocksPos.splice(i, 0, [bp0]);
+    
+    for (j = 1; j < blocksPos[i].length; j ++) {
+      if (bp1 <= blocksPos[i][j][0]) break;
+    }
+    if (add && bp1 !== blocksPos[i][j]?.[0]) blocksPos[i].splice(j, 0, [bp1]);
+    
+    for (k = 1; k < blocksPos[i][j].length; k ++) {
+      if (bp2 <= blocksPos[i][j][k]?.[0]) break;
+    }
+        
     if (add) {
-      if (!blocksPos[bp0]) blocksPos[bp0] = [];
-      if (!blocksPos[bp0][bp1]) blocksPos[bp0][bp1] = [];
-      blocksPos[bp0][bp1][bp2] = indices;
+      blocksPos[i][j].splice(k, 0, [bp2, indices]);
     } else {
-      delete blocksPos[bp0][bp1][bp2];
-      if (blocksPos[bp0][bp1].reduce(x => x + 1, 0) === 0) delete blocksPos[bp0][bp1];
-      if (blocksPos[bp0].reduce(x => x + 1, 0) === 0) delete blocksPos[bp0];
+      blocksPos[i][j].splice(k, 1);
+      if (blocksPos[i][j].length === 1) blocksPos[i].splice(j, 1);
+      if (blocksPos[i].length === 1) blocksPos.splice(i, 1);
     }
   }
 };
 
 ChunkMeshAlpha.prototype.updateBlocks = function(x, y, z, a, b, c, d, add) {
+  const pos = x + ',' + y + ',' + z;
   if (add) {
-    let indices = this.blocksX?.[x]?.[y]?.[z];
+    let indices = this.blocksData[pos];
     if (indices === undefined) {
-      indices = []; // list of indices
+      indices = this.blocksData[pos] = []; // list of indices
       this.updateBlocksPos(x, y, z, true, indices);
     }
     indices.push(
@@ -118,7 +157,7 @@ ChunkMeshAlpha.prototype.updateBlocks = function(x, y, z, a, b, c, d, add) {
     );
     this.indicesLength += 6;
   } else {
-    let indices = this.blocksX[x][y][z], i, data;
+    let indices = this.blocksData[pos], i, data;
     for (i = 0; i < indices.length; i += 6) {
       if (a === indices[i] && b === indices[i + 1] && c === indices[i + 2] && d === indices[i + 4]) {
         indices.splice(i, 6);
@@ -128,6 +167,7 @@ ChunkMeshAlpha.prototype.updateBlocks = function(x, y, z, a, b, c, d, add) {
     }
     if (indices.length === 0) {
       this.updateBlocksPos(x, y, z, false);
+      delete this.blocksData[pos];
     }
   }
 };

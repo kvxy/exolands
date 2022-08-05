@@ -1,7 +1,7 @@
 extend(Player, Entity);
 function Player(...args) { // (data, world)
   this.__super__.constructor.call(this, ...args);
-  this.holding = 'red_glass';
+  this.holding = 'stone';
   this.velocity = [0, 0, 0];
   this.rotation = [0, 0, 0];
 }
@@ -21,14 +21,14 @@ Player.prototype.move = function() {
 
 // adds block at end of raycast
 Player.prototype.placeBlock = function(block = this.holding) {
-  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 20);
+  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 50);
   if (blocks[1] === undefined) return;
   sim.setBlock(blocks[1].x, blocks[1].y, blocks[1].z, block);
 };
 
 // removes the first block from raycast
 Player.prototype.breakBlock = function() {
-  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 20);
+  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 50);
   if (blocks[0] === undefined) return;
   sim.setBlock(blocks[0].x, blocks[0].y, blocks[0].z, 'air');
 };

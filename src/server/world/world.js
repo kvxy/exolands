@@ -1,17 +1,17 @@
 // handles one world
 // one server may have multiple worlds running in parallel
 function World() {
+  this.blockKeys = Object.keys(Blocks);
+  this.blockIDs = Object.fromEntries(this.blockKeys.map((x, i) => [x, i]));
+  
   this.seed = Date.now();
-  this.generator = new Generator(this.seed);
+  this.generator = new Generator(this.seed, this.blockIDs);
   
   this.chunks = {};
   this.entities = {};
   
   this.player = undefined;
   this.playerID = undefined;
-  
-  this.blockIDs = Object.keys(Blocks);
-  this.blockKeys = Object.fromEntries(this.blockIDs.map((x, i) => [x, i]));;
 }
 
 // tick
@@ -37,7 +37,7 @@ World.prototype.tick = function() {
 World.prototype.generateChunk = function(x, y, z) {
   const c = x + ',' + y + ',' + z;
   if (this.chunks[c]) return;
-  this.chunks[c] = new Chunk(x, y, z, this.generator.generateChunk(x, y, z), this.blockIDs, this.chunks);
+  this.chunks[c] = new Chunk(x, y, z, this.generator.generateChunk(x, y, z), this.blockKeys, this.chunks);
 };
 
 // load saved chunk
@@ -46,18 +46,18 @@ World.prototype.loadChunk = function(x, y, z) {
 };
 
 World.prototype.setBlock = function(x, y, z, block, blockData = this.getBlockData(x, y, z)) {
-  if (this.blockKeys[block] === undefined) return -1;
-  blockData.chunk.blocks[blockData.index] = this.blockKeys[block];
+  if (this.blockIDs[block] === undefined) return -1;
+  blockData.chunk.blocks[blockData.index] = this.blockIDs[block];
 };
 
 // returns block type given the index (ID)
 World.prototype.blockType = function(index) {
-  return this.blockIDs[index];
+  return this.blockKeys[index];
 };
 
 // returns block ID given type
 World.prototype.blockID = function(type) {
-  return this.blockKeys[type];
+  return this.blockIDs[type];
 };
 
 // returns info of block from blockData given an index

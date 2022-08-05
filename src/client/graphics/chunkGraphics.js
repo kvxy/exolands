@@ -1,11 +1,14 @@
 function ChunkGraphics(world) {
   this.world = world;
   this.chunks = world.chunks;
+  this.chunkDistances = {};
 
   this.shaders = {};
+  
+  this.prevCamera = {};
 }
 
-ChunkGraphics.prototype.initShaders = function(shaderName, vertSrc, fragSrc) {
+ChunkGraphics.prototype.initShader = function(shaderName, vertSrc, fragSrc) {
   const gl = this.gl,
         renderer = new Renderer(gl, vertSrc, fragSrc),
         program = renderer.program;
@@ -54,8 +57,8 @@ ChunkGraphics.prototype.init = function() {
   textures.createTextureArray(gl);
 
   // load shaders and programs
-  this.initShaders('default', blockVertSrc, blockFragSrc);
-  this.initShaders('alpha', alphaBlockVertSrc, alphaBlockFragSrc);
+  this.initShader('default', blockVertSrc, blockFragSrc);
+  this.initShader('alpha', alphaBlockVertSrc, alphaBlockFragSrc);
 
   // projection matrix
   this.projectionMatrix = new mat4();
@@ -70,65 +73,30 @@ ChunkGraphics.prototype.init = function() {
   window.onresize = onResize;
 };
 
-// draws current scene
-ChunkGraphics.prototype.draw = function() {
-  const gl = this.gl;
-  gl.clearColor(0, 0.5, 0.8, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-  // camera matrix (only needs to be calculated on camera movement)
-  const camera = this.world.player;
-  const cameraMatrix = new mat4();
-  cameraMatrix.rotateX(camera.rotation[0]);
-  cameraMatrix.rotateY(camera.rotation[1]);
-  cameraMatrix.translate(-camera.x, -camera.y, -camera.z);
-  cameraMatrix.scale(0.0625, 0.0625, 0.0625);
-
-  // regular block shader
-  let s, shader;
-  for (s in this.shaders) {
-    shader = this.shaders[s];
-
-    if (s === 'alpha') {
-      gl.enable(gl.BLEND);
-    } else {
-      gl.disable(gl.BLEND);
-    }
-
-    gl.useProgram(shader.program);
-    gl.uniformMatrix4fv(shader.uniforms.camera, false, cameraMatrix.data);
-
-    // SORT CHUNKMESHES BY https://www.reddit.com/r/VoxelGameDev/comments/a0l8zc/correct_depthordering_for_translucent_discrete/
-    // REVERSE ORDER WHEN DRAWING ALPHA
-    for (let c in shader.chunkMeshes) {
-      let chunkMesh = shader.chunkMeshes[c];
-
-      if (chunkMesh.update) {
-        chunkMesh.updateBuffers();
-        chunkMesh.update = false;
-      }
-      if (chunkMesh.indices.length === 0) continue;
-      
-      //if (s === 'alpha') chunkMesh.sort(camera);
-      
-      gl.uniform3f(shader.uniforms.chunkPosition, chunkMesh.x * 512, chunkMesh.y * 512, chunkMesh.z * 512);
-      gl.bindVertexArray(chunkMesh.vao);
-      gl.drawElements(gl.TRIANGLES, chunkMesh.indices.length, gl.UNSIGNED_INT, 0);
-    }
-  }
-};
-
 ChunkGraphics.prototype.setBlock = function(x, y, z, block, prevBlockData) {
   if (block === prevBlockData.type) return -1; // UNLESS BLOCKDATA IS DIFFERENT (EG DIFFERENT ROTATION) ...OR JUST REMOVE...
   let prevBlockInfo = this.world.getBlockInfo(prevBlockData.type),
-      blockInfo = this.world.getBlockInfo(block),
-      chunkMesh = this.shaders[blockInfo.isInvisible ? prevBlockInfo.shader : blockInfo.shader].chunkMeshes[prevBlockData.chunkPos];    
+      blockInfo = this.world.getBlockInfo(block);
   if (!prevBlockInfo.isInvisible || blockInfo.isInvisible) {
-    chunkMesh.removeBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, prevBlockData);
+    if (!this.shaders[prevBlockInfo.shader].chunkMeshes[prevBlockData.chunkPos]) this.loadChunkMesh(prevBlockInfo.shader, prevBlockData.chunkPos, true);
+    this.shaders[prevBlockInfo.shader].chunkMeshes[prevBlockData.chunkPos].removeBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, prevBlockData);
   }
   if (!blockInfo.isInvisible) {
-    chunkMesh.addBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, block);
+    if (!this.shaders[blockInfo.shader].chunkMeshes[prevBlockData.chunkPos]) this.loadChunkMesh(blockInfo.shader, prevBlockData.chunkPos, true);
+    this.shaders[blockInfo.shader].chunkMeshes[prevBlockData.chunkPos].addBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, block);
+    
   }
+};
+
+ChunkGraphics.prototype.loadChunkMesh = function(shader, pos, load = false) {
+  const data = [ this.chunks[pos], shader, this ];
+  const chunkMesh = this.shaders[shader].chunkMeshes[pos] = { 
+    default: new ChunkMesh(...data),
+    alpha: new ChunkMeshAlpha(...data),
+    water: new ChunkMeshWater(...data)
+  }[shader];
+  if (load) chunkMesh.load();
+  return chunkMesh;
 };
 
 // loads a chunk's mesh
@@ -136,9 +104,8 @@ ChunkGraphics.prototype.loadChunk = function(x, y, z) {
   const c = x + ',' + y + ',' + z;    
   if (this.shaders.default.chunkMeshes[c]) return;
 
-  const chunk = this.chunks[c],
-        chunkMesh = this.shaders.default.chunkMeshes[c] = new ChunkMesh(chunk, this.gl, this.shaders, 'default', this.world, this.textures),
-        chunkMeshAlpha = this.shaders.alpha.chunkMeshes[c] = new ChunkMeshAlpha(chunk, this.gl, this.shaders, 'alpha', this.world, this.textures);
+  const chunk = this.chunks[c];
+  let chunkMeshes = [], i;
 
   let fz, fy, fx, p, pos, blockData, otherBlockData, blockInfo, otherBlockInfo, faceInteraction;
   for (fz = 0; fz < 32; fz ++) {
@@ -156,9 +123,11 @@ ChunkGraphics.prototype.loadChunk = function(x, y, z) {
 
             // INNER MESH
             if (!blockInfo.isInvisible && ChunkMesh.faceInteraction(blockData, otherBlockData, true, p * 2, blockInfo, otherBlockInfo)[0]) {
+              if (!this.shaders[blockInfo.shader].chunkMeshes[c]) chunkMeshes.push(this.loadChunkMesh(blockInfo.shader, c));
               this.shaders[blockInfo.shader].chunkMeshes[c].addCubeFace(fx, fy, fz, p * 2, this.textures.textureKeys[blockInfo.texture[p * 2]]);
             }
             if (!otherBlockInfo.isInvisible && ChunkMesh.faceInteraction(otherBlockData, blockData, true, p * 2, otherBlockInfo, blockInfo)[0]) {
+              if (!this.shaders[otherBlockInfo.shader].chunkMeshes[c]) chunkMeshes.push(this.loadChunkMesh(otherBlockInfo.shader, c));
               this.shaders[otherBlockInfo.shader].chunkMeshes[c].addCubeFace(fx + (p === 0), fy + (p === 1), fz + (p === 2), p * 2 + 1, this.textures.textureKeys[otherBlockInfo.texture[p * 2 + 1]]);
             }
           }
@@ -173,17 +142,85 @@ ChunkGraphics.prototype.loadChunk = function(x, y, z) {
             if (otherBlockData === undefined) continue;
             otherBlockInfo = this.world.getBlockInfo(otherBlockData.type);
             if (!blockInfo.isInvisible && ChunkMesh.faceInteraction(blockData, otherBlockData, true, p * 2, blockInfo, otherBlockInfo)[0]) {
+              if (!this.shaders[blockInfo.shader].chunkMeshes[c]) chunkMeshes.push(this.loadChunkMesh(blockInfo.shader, c));
               this.shaders[blockInfo.shader].chunkMeshes[c].addCubeFace(fx, fy, fz, p * 2 + (pos === 0), this.textures.textureKeys[blockInfo.texture[p * 2 + (pos === 0)]]);
             }
             if (!otherBlockInfo.isInvisible && ChunkMesh.faceInteraction(otherBlockData, blockData, true, p * 2, otherBlockInfo, blockInfo)[0]) {
-              this.shaders[blockInfo.shader].chunkMeshes[otherBlockData.chunkPos].addCubeFace(otherBlockData.x, otherBlockData.y, otherBlockData.z, p * 2 + (pos === 31), this.textures.textureKeys[otherBlockInfo.texture[p * 2 + (pos === 31)]]);
+              if (!this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos]) chunkMeshes.push(this.loadChunkMesh(otherBlockInfo.shader, otherBlockData.chunkPos));
+              this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos].addCubeFace(otherBlockData.x, otherBlockData.y, otherBlockData.z, p * 2 + (pos === 31), this.textures.textureKeys[otherBlockInfo.texture[p * 2 + (pos === 31)]]);
             }
           }
         }
       }
     }
   }
+  
+  for (i in chunkMeshes) {
+    chunkMeshes[i].load();
+  }
+};
 
-  chunkMesh.load();
-  chunkMeshAlpha.load();
-}
+// draws current scene
+ChunkGraphics.prototype.draw = function() {
+  const gl = this.gl;
+  gl.clearColor(0, 0.5, 0.8, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // camera matrix (only needs to be calculated on camera movement)
+  const camera = this.world.player;
+  const cameraMatrix = new mat4();
+  cameraMatrix.rotateX(camera.rotation[0]);
+  cameraMatrix.rotateY(camera.rotation[1]);
+  cameraMatrix.translate(-camera.x, -camera.y, -camera.z);
+  cameraMatrix.scale(0.0625, 0.0625, 0.0625);
+  
+  // see if player moved between chunks
+  let sortChunkMeshes = false;
+  if (Math.floor(camera.x / 32) !== this.prevCamera.x || Math.floor(camera.y / 32) !== this.prevCamera.y || Math.floor(camera.z / 32) !== this.prevCamera.z) {
+    // get chunk distances
+    let c, chunk;
+    for (c in this.chunks) {
+      chunk = this.chunks[c];
+      this.chunkDistances[c] = Math.abs(chunk.x * 32 - camera.x + 16) + Math.abs(chunk.y * 32 - camera.y + 16) + Math.abs(chunk.z * 32 - camera.z + 16);
+    }    
+    // update prev camera
+    this.prevCamera.x = Math.floor(camera.x / 32); 
+    this.prevCamera.y = Math.floor(camera.y / 32);
+    this.prevCamera.z = Math.floor(camera.z / 32);
+    sortChunkMeshes = true;
+    
+    this.shaders.default.chunkMeshes = Object.fromEntries(Object.entries(this.shaders.default.chunkMeshes).sort((a, b) => (this.chunkDistances[a[1].pos] - this.chunkDistances[b[1].pos])));
+    this.shaders.alpha.chunkMeshes = Object.fromEntries(Object.entries(this.shaders.alpha.chunkMeshes).sort((a, b) => (this.chunkDistances[b[1].pos] - this.chunkDistances[a[1].pos])));
+  }
+  
+  // regular block shader
+  let s, c, shader, data, chunkMesh;
+  for (s in this.shaders) {
+    shader = this.shaders[s];
+
+    if (s === 'alpha') {
+      gl.enable(gl.BLEND);
+      data = ChunkMeshAlpha.processCameraData(camera);
+    } else {
+      gl.disable(gl.BLEND);
+    }
+
+    gl.useProgram(shader.program);
+    gl.uniformMatrix4fv(shader.uniforms.camera, false, cameraMatrix.data);
+    
+    for (c in shader.chunkMeshes) {
+      chunkMesh = shader.chunkMeshes[c];
+      if ((chunkMesh.indicesLength ?? chunkMesh.indices.length) === 0) continue;
+      
+      if (s === 'alpha') chunkMesh.updateIndices(...data);
+      if (chunkMesh.update) {
+        chunkMesh.updateBuffers();
+        chunkMesh.update = false;
+      }
+      
+      gl.uniform3f(shader.uniforms.chunkPosition, chunkMesh.x * 512, chunkMesh.y * 512, chunkMesh.z * 512);
+      gl.bindVertexArray(chunkMesh.vao);
+      gl.drawElements(gl.TRIANGLES, chunkMesh.indicesLength ?? chunkMesh.indices.length, gl.UNSIGNED_INT, 0);
+    }
+  }
+};

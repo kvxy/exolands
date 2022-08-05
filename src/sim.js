@@ -3,7 +3,9 @@ function Sim() {
   this.server = true; // simulate everything
   this.client = true; // display and inputs
   
-  this.actions = ['draw', 'generateChunk', 'setBlock', 'spawnPlayer']
+  this.actions = ['draw', 'generateChunk', 'setBlock', 'spawnPlayer'];
+  
+  this.ticks = 0;
 }
 
 Sim.prototype.init = function() {
@@ -62,4 +64,5 @@ Sim.prototype.spawnPlayer = function(data) {
 
 Sim.prototype.tick = function() {
   this.world.tick();
+  this.ticks ++;
 };

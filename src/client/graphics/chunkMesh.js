@@ -1,6 +1,9 @@
 function ChunkMesh(...args) {
-  [ this.chunk, this.gl, this.shaders, this.shaderName, this.world, this.textures ] = args;
+  [ this.chunk, this.shaderName, this.chunkGraphics ] = args;
+  [ this.gl, this.shaders, this.world, this.textures ] = [ this.chunkGraphics.gl, this.chunkGraphics.shaders, this.chunkGraphics.world, this.chunkGraphics.textures ];
   [ this.x, this.y, this.z ] = [ this.chunk.x, this.chunk.y, this.chunk.z ];
+  
+  this.pos = this.x + ',' + this.y + ',' + this.z;
   this.vertex0 = [];
   this.vertex1 = [];
   this.vertexSlots = [];
@@ -202,6 +205,7 @@ ChunkMesh.prototype.updateBlock = function(x, y, z, add, block) {
       if (add) {
         this.addCubeFace(x, y, z, i, this.textures.textureKeys[blockInfo.texture[i]]);
       } else {
+        if (!this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos]) this.chunkGraphics.loadChunkMesh(otherBlockInfo.shader, otherBlockData.chunkPos, true);
         this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos].addCubeFace(otherBlockData.x, otherBlockData.y, otherBlockData.z, i + (i % 2 === 0 ? 1 : -1), this.textures.textureKeys[otherBlockInfo.texture[i + (i % 2 === 0 ? 1 : -1)]]);
       }
     }

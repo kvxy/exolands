@@ -61,11 +61,36 @@ const Blocks = (function() {
       isTranslucent: true,
       texture: ['green_glass', 'green_glass', 'green_glass', 'green_glass', 'green_glass', 'green_glass']
     },
+    water: {
+      shape: 'water',
+      isTranslucent: true,
+      texture: ['blue_glass', 'blue_glass', 'blue_glass', 'blue_glass', 'blue_glass', 'blue_glass'],
+    },
+    sand: {
+      shape: 'cube',
+      texture: [ 'sand', 'sand', 'sand', 'sand', 'sand', 'sand' ]
+    },
+    log: {
+      shape: 'cube',
+      texture: [ 'log_side', 'log_side', 'log_top', 'log_top', 'log_side', 'log_side' ]
+    },
+    marble: {
+      shape: 'cube',
+      texture: [ 'marble', 'marble', 'marble', 'marble', 'marble', 'marble' ]
+    },
+    tainted_marble: {
+      shape: 'cube',
+      texture: [ 'tainted_marble', 'tainted_marble', 'tainted_marble', 'tainted_marble', 'tainted_marble', 'tainted_marble' ]
+    },
+    jungle_marble: {
+      shape: 'cube',
+      texture: [ 'jungle_marble', 'jungle_marble', 'jungle_marble', 'jungle_marble', 'jungle_marble', 'jungle_marble' ]
+    }
   };
 
   for (let b in Blocks) {
     let block = Blocks[b];
-    if (block.isTranslucent) {
+    if (block.isTranslucent && !block.shader) {
       block.shader = 'alpha';
     } else {
       block.shader = 'default';

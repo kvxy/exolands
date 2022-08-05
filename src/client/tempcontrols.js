@@ -10,6 +10,8 @@ function initControls() {
     17: 'lock'     // ctrl
   };
   let input = Object.fromEntries(Object.entries(keymap).map(a => [a[1], false]));
+  let leftMouse = false;
+  let rightMouse = false;
   
   sim.world.player.tick = function() {    
     const speed = 0.05;
@@ -24,6 +26,10 @@ function initControls() {
     this.moveX(vx);
     this.moveY(vy);
     this.moveZ(vz);
+    
+    if (sim.ticks % 5 !== 0) return;
+    if (leftMouse) sim.world.player.breakBlock();
+    if (rightMouse) sim.world.player.placeBlock();
   };
   
   // event listeners
@@ -39,9 +45,17 @@ function initControls() {
   
   window.addEventListener('mousedown', e => {
     if (event.button === 2) {
-      sim.world.player.placeBlock();
+      rightMouse = true;
     } else if (event.button === 0) {
-      sim.world.player.breakBlock();
+      leftMouse = true;
+    }
+  });
+  
+  window.addEventListener('mouseup', e => {
+    if (event.button === 2) {
+      rightMouse = false;
+    } else if (event.button === 0) {
+      leftMouse = false;
     }
   });
 

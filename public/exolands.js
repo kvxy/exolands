@@ -30,11 +30,14 @@ ClientSim.spawnPlayer = function(data) {
 function ChunkGraphics(world) {
   this.world = world;
   this.chunks = world.chunks;
+  this.chunkDistances = {};
 
   this.shaders = {};
+  
+  this.prevCamera = {};
 }
 
-ChunkGraphics.prototype.initShaders = function(shaderName, vertSrc, fragSrc) {
+ChunkGraphics.prototype.initShader = function(shaderName, vertSrc, fragSrc) {
   const gl = this.gl,
         renderer = new Renderer(gl, vertSrc, fragSrc),
         program = renderer.program;
@@ -83,8 +86,8 @@ ChunkGraphics.prototype.init = function() {
   textures.createTextureArray(gl);
 
   // load shaders and programs
-  this.initShaders('default', blockVertSrc, blockFragSrc);
-  this.initShaders('alpha', alphaBlockVertSrc, alphaBlockFragSrc);
+  this.initShader('default', blockVertSrc, blockFragSrc);
+  this.initShader('alpha', alphaBlockVertSrc, alphaBlockFragSrc);
 
   // projection matrix
   this.projectionMatrix = new mat4();
@@ -99,65 +102,30 @@ ChunkGraphics.prototype.init = function() {
   window.onresize = onResize;
 };
 
-// draws current scene
-ChunkGraphics.prototype.draw = function() {
-  const gl = this.gl;
-  gl.clearColor(0, 0.5, 0.8, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-  // camera matrix (only needs to be calculated on camera movement)
-  const camera = this.world.player;
-  const cameraMatrix = new mat4();
-  cameraMatrix.rotateX(camera.rotation[0]);
-  cameraMatrix.rotateY(camera.rotation[1]);
-  cameraMatrix.translate(-camera.x, -camera.y, -camera.z);
-  cameraMatrix.scale(0.0625, 0.0625, 0.0625);
-
-  // regular block shader
-  let s, shader;
-  for (s in this.shaders) {
-    shader = this.shaders[s];
-
-    if (s === 'alpha') {
-      gl.enable(gl.BLEND);
-    } else {
-      gl.disable(gl.BLEND);
-    }
-
-    gl.useProgram(shader.program);
-    gl.uniformMatrix4fv(shader.uniforms.camera, false, cameraMatrix.data);
-
-    // SORT CHUNKMESHES BY https://www.reddit.com/r/VoxelGameDev/comments/a0l8zc/correct_depthordering_for_translucent_discrete/
-    // REVERSE ORDER WHEN DRAWING ALPHA
-    for (let c in shader.chunkMeshes) {
-      let chunkMesh = shader.chunkMeshes[c];
-
-      if (chunkMesh.update) {
-        chunkMesh.updateBuffers();
-        chunkMesh.update = false;
-      }
-      if (chunkMesh.indices.length === 0) continue;
-      
-      //if (s === 'alpha') chunkMesh.sort(camera);
-      
-      gl.uniform3f(shader.uniforms.chunkPosition, chunkMesh.x * 512, chunkMesh.y * 512, chunkMesh.z * 512);
-      gl.bindVertexArray(chunkMesh.vao);
-      gl.drawElements(gl.TRIANGLES, chunkMesh.indices.length, gl.UNSIGNED_INT, 0);
-    }
-  }
-};
-
 ChunkGraphics.prototype.setBlock = function(x, y, z, block, prevBlockData) {
   if (block === prevBlockData.type) return -1; // UNLESS BLOCKDATA IS DIFFERENT (EG DIFFERENT ROTATION) ...OR JUST REMOVE...
   let prevBlockInfo = this.world.getBlockInfo(prevBlockData.type),
-      blockInfo = this.world.getBlockInfo(block),
-      chunkMesh = this.shaders[blockInfo.isInvisible ? prevBlockInfo.shader : blockInfo.shader].chunkMeshes[prevBlockData.chunkPos];    
+      blockInfo = this.world.getBlockInfo(block);
   if (!prevBlockInfo.isInvisible || blockInfo.isInvisible) {
-    chunkMesh.removeBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, prevBlockData);
+    if (!this.shaders[prevBlockInfo.shader].chunkMeshes[prevBlockData.chunkPos]) this.loadChunkMesh(prevBlockInfo.shader, prevBlockData.chunkPos, true);
+    this.shaders[prevBlockInfo.shader].chunkMeshes[prevBlockData.chunkPos].removeBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, prevBlockData);
   }
   if (!blockInfo.isInvisible) {
-    chunkMesh.addBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, block);
+    if (!this.shaders[blockInfo.shader].chunkMeshes[prevBlockData.chunkPos]) this.loadChunkMesh(blockInfo.shader, prevBlockData.chunkPos, true);
+    this.shaders[blockInfo.shader].chunkMeshes[prevBlockData.chunkPos].addBlock(prevBlockData.x, prevBlockData.y, prevBlockData.z, block);
+    
   }
+};
+
+ChunkGraphics.prototype.loadChunkMesh = function(shader, pos, load = false) {
+  const data = [ this.chunks[pos], shader, this ];
+  const chunkMesh = this.shaders[shader].chunkMeshes[pos] = { 
+    default: new ChunkMesh(...data),
+    alpha: new ChunkMeshAlpha(...data),
+    water: new ChunkMeshWater(...data)
+  }[shader];
+  if (load) chunkMesh.load();
+  return chunkMesh;
 };
 
 // loads a chunk's mesh
@@ -165,9 +133,8 @@ ChunkGraphics.prototype.loadChunk = function(x, y, z) {
   const c = x + ',' + y + ',' + z;    
   if (this.shaders.default.chunkMeshes[c]) return;
 
-  const chunk = this.chunks[c],
-        chunkMesh = this.shaders.default.chunkMeshes[c] = new ChunkMesh(chunk, this.gl, this.shaders, 'default', this.world, this.textures),
-        chunkMeshAlpha = this.shaders.alpha.chunkMeshes[c] = new ChunkMeshAlpha(chunk, this.gl, this.shaders, 'alpha', this.world, this.textures);
+  const chunk = this.chunks[c];
+  let chunkMeshes = [], i;
 
   let fz, fy, fx, p, pos, blockData, otherBlockData, blockInfo, otherBlockInfo, faceInteraction;
   for (fz = 0; fz < 32; fz ++) {
@@ -185,9 +152,11 @@ ChunkGraphics.prototype.loadChunk = function(x, y, z) {
 
             // INNER MESH
             if (!blockInfo.isInvisible && ChunkMesh.faceInteraction(blockData, otherBlockData, true, p * 2, blockInfo, otherBlockInfo)[0]) {
+              if (!this.shaders[blockInfo.shader].chunkMeshes[c]) chunkMeshes.push(this.loadChunkMesh(blockInfo.shader, c));
               this.shaders[blockInfo.shader].chunkMeshes[c].addCubeFace(fx, fy, fz, p * 2, this.textures.textureKeys[blockInfo.texture[p * 2]]);
             }
             if (!otherBlockInfo.isInvisible && ChunkMesh.faceInteraction(otherBlockData, blockData, true, p * 2, otherBlockInfo, blockInfo)[0]) {
+              if (!this.shaders[otherBlockInfo.shader].chunkMeshes[c]) chunkMeshes.push(this.loadChunkMesh(otherBlockInfo.shader, c));
               this.shaders[otherBlockInfo.shader].chunkMeshes[c].addCubeFace(fx + (p === 0), fy + (p === 1), fz + (p === 2), p * 2 + 1, this.textures.textureKeys[otherBlockInfo.texture[p * 2 + 1]]);
             }
           }
@@ -202,27 +171,98 @@ ChunkGraphics.prototype.loadChunk = function(x, y, z) {
             if (otherBlockData === undefined) continue;
             otherBlockInfo = this.world.getBlockInfo(otherBlockData.type);
             if (!blockInfo.isInvisible && ChunkMesh.faceInteraction(blockData, otherBlockData, true, p * 2, blockInfo, otherBlockInfo)[0]) {
+              if (!this.shaders[blockInfo.shader].chunkMeshes[c]) chunkMeshes.push(this.loadChunkMesh(blockInfo.shader, c));
               this.shaders[blockInfo.shader].chunkMeshes[c].addCubeFace(fx, fy, fz, p * 2 + (pos === 0), this.textures.textureKeys[blockInfo.texture[p * 2 + (pos === 0)]]);
             }
             if (!otherBlockInfo.isInvisible && ChunkMesh.faceInteraction(otherBlockData, blockData, true, p * 2, otherBlockInfo, blockInfo)[0]) {
-              this.shaders[blockInfo.shader].chunkMeshes[otherBlockData.chunkPos].addCubeFace(otherBlockData.x, otherBlockData.y, otherBlockData.z, p * 2 + (pos === 31), this.textures.textureKeys[otherBlockInfo.texture[p * 2 + (pos === 31)]]);
+              if (!this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos]) chunkMeshes.push(this.loadChunkMesh(otherBlockInfo.shader, otherBlockData.chunkPos));
+              this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos].addCubeFace(otherBlockData.x, otherBlockData.y, otherBlockData.z, p * 2 + (pos === 31), this.textures.textureKeys[otherBlockInfo.texture[p * 2 + (pos === 31)]]);
             }
           }
         }
       }
     }
   }
+  
+  for (i in chunkMeshes) {
+    chunkMeshes[i].load();
+  }
+};
 
-  chunkMesh.load();
-  chunkMeshAlpha.load();
-}
+// draws current scene
+ChunkGraphics.prototype.draw = function() {
+  const gl = this.gl;
+  gl.clearColor(0, 0.5, 0.8, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // camera matrix (only needs to be calculated on camera movement)
+  const camera = this.world.player;
+  const cameraMatrix = new mat4();
+  cameraMatrix.rotateX(camera.rotation[0]);
+  cameraMatrix.rotateY(camera.rotation[1]);
+  cameraMatrix.translate(-camera.x, -camera.y, -camera.z);
+  cameraMatrix.scale(0.0625, 0.0625, 0.0625);
+  
+  // see if player moved between chunks
+  let sortChunkMeshes = false;
+  if (Math.floor(camera.x / 32) !== this.prevCamera.x || Math.floor(camera.y / 32) !== this.prevCamera.y || Math.floor(camera.z / 32) !== this.prevCamera.z) {
+    // get chunk distances
+    let c, chunk;
+    for (c in this.chunks) {
+      chunk = this.chunks[c];
+      this.chunkDistances[c] = Math.abs(chunk.x * 32 - camera.x + 16) + Math.abs(chunk.y * 32 - camera.y + 16) + Math.abs(chunk.z * 32 - camera.z + 16);
+    }    
+    // update prev camera
+    this.prevCamera.x = Math.floor(camera.x / 32); 
+    this.prevCamera.y = Math.floor(camera.y / 32);
+    this.prevCamera.z = Math.floor(camera.z / 32);
+    sortChunkMeshes = true;
+    
+    this.shaders.default.chunkMeshes = Object.fromEntries(Object.entries(this.shaders.default.chunkMeshes).sort((a, b) => (this.chunkDistances[a[1].pos] - this.chunkDistances[b[1].pos])));
+    this.shaders.alpha.chunkMeshes = Object.fromEntries(Object.entries(this.shaders.alpha.chunkMeshes).sort((a, b) => (this.chunkDistances[b[1].pos] - this.chunkDistances[a[1].pos])));
+  }
+  
+  // regular block shader
+  let s, c, shader, data, chunkMesh;
+  for (s in this.shaders) {
+    shader = this.shaders[s];
+
+    if (s === 'alpha') {
+      gl.enable(gl.BLEND);
+      data = ChunkMeshAlpha.processCameraData(camera);
+    } else {
+      gl.disable(gl.BLEND);
+    }
+
+    gl.useProgram(shader.program);
+    gl.uniformMatrix4fv(shader.uniforms.camera, false, cameraMatrix.data);
+    
+    for (c in shader.chunkMeshes) {
+      chunkMesh = shader.chunkMeshes[c];
+      if ((chunkMesh.indicesLength ?? chunkMesh.indices.length) === 0) continue;
+      
+      if (s === 'alpha') chunkMesh.updateIndices(...data);
+      if (chunkMesh.update) {
+        chunkMesh.updateBuffers();
+        chunkMesh.update = false;
+      }
+      
+      gl.uniform3f(shader.uniforms.chunkPosition, chunkMesh.x * 512, chunkMesh.y * 512, chunkMesh.z * 512);
+      gl.bindVertexArray(chunkMesh.vao);
+      gl.drawElements(gl.TRIANGLES, chunkMesh.indicesLength ?? chunkMesh.indices.length, gl.UNSIGNED_INT, 0);
+    }
+  }
+};
 
 
 /** ./src/client/graphics/chunkMesh.js **/
 
 function ChunkMesh(...args) {
-  [ this.chunk, this.gl, this.shaders, this.shaderName, this.world, this.textures ] = args;
+  [ this.chunk, this.shaderName, this.chunkGraphics ] = args;
+  [ this.gl, this.shaders, this.world, this.textures ] = [ this.chunkGraphics.gl, this.chunkGraphics.shaders, this.chunkGraphics.world, this.chunkGraphics.textures ];
   [ this.x, this.y, this.z ] = [ this.chunk.x, this.chunk.y, this.chunk.z ];
+  
+  this.pos = this.x + ',' + this.y + ',' + this.z;
   this.vertex0 = [];
   this.vertex1 = [];
   this.vertexSlots = [];
@@ -424,6 +464,7 @@ ChunkMesh.prototype.updateBlock = function(x, y, z, add, block) {
       if (add) {
         this.addCubeFace(x, y, z, i, this.textures.textureKeys[blockInfo.texture[i]]);
       } else {
+        if (!this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos]) this.chunkGraphics.loadChunkMesh(otherBlockInfo.shader, otherBlockData.chunkPos, true);
         this.shaders[otherBlockInfo.shader].chunkMeshes[otherBlockData.chunkPos].addCubeFace(otherBlockData.x, otherBlockData.y, otherBlockData.z, i + (i % 2 === 0 ? 1 : -1), this.textures.textureKeys[otherBlockInfo.texture[i + (i % 2 === 0 ? 1 : -1)]]);
       }
     }
@@ -455,90 +496,115 @@ extend(ChunkMeshAlpha, ChunkMesh);
 function ChunkMeshAlpha(...args) {
   this.__super__.constructor.call(this, ...args);
   
-  // stores indices in each block coordinate
-  // eg data at (x: 5, y: 6, z: 7) is stored in as blocksX[5][6][7] and blocksY[6][7][5] and blocksZ[7][5][6]
+  // stores indices in each block coordinate for easy iteration
   this.blocksX = [];
   this.blocksY = [];
   this.blocksZ = [];
-  this.indicesLength = 0;
+  this.blocksData = {};
   
-  // checks relevant changes in camera
-  this.changes = { x: NaN, y: NaN, z: NaN, greatestDir: '' };
+  this.indices = [];
+  this.indicesLength = 0;
 }
 
-ChunkMeshAlpha.prototype.makeIndicesIterator = function*(x, y, z, vx, vy, vz) {
-  const avx = Math.abs(vx),
+ChunkMeshAlpha.prototype.updateBuffers = function() {
+  const gl = this.gl;
+  gl.bindVertexArray(this.vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, this.vertex0Buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Uint32Array(this.vertex0), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, this.vertex1Buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Uint32Array(this.vertex1), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, this.indices, gl.DYNAMIC_DRAW);  
+  delete this.indices;
+};
+
+ChunkMeshAlpha.changes = { x: NaN, y: NaN, z: NaN, greatestDir: '' };
+ChunkMeshAlpha.processCameraData = function(camera) {
+  const x = Math.floor(camera.x),
+        y = Math.floor(camera.y),
+        z = Math.floor(camera.z),
+        rx = camera.rotation[0],
+        ry = camera.rotation[1],
+        vx = Math.sin(ry) * Math.cos(rx),
+        vy = Math.sin(rx),
+        vz = Math.cos(ry) * Math.cos(rx),
+        avx = Math.abs(vx),
         avy = Math.abs(vy),
         avz = Math.abs(vz),
         greatestDir = (avx > avy ? (avx > avz ? 'X' : 'Z') : (avy > avz ? 'Y' : 'Z')),
-        greatestMag = greatestDir === 'X' ? vx : greatestDir === 'Y' ? vy : vz,
-        blocksPos = this['blocks' + greatestDir],
-        otherPos = greatestDir === 'X' ? [ y, z ] : greatestDir === 'Y' ? [ z, x ] : [ x, y ];
-  x = Math.floor(x);
-  y = Math.floor(y);
-  z = Math.floor(z);
+        greatestMag = greatestDir === 'X' ? vx : greatestDir === 'Y' ? vy : vz;
   
   // ONLY UPDATE WHEN: camera's block position changes OR camera rotatation that results in a change in greatest direction
   const changes = this.changes;
-  if ((x - changes.x) === 0 && (y - changes.y) === 0 && (z - changes.z) !== 0 && changes.greatestDir === greatestDir) return -1;
+  let changed = true;
+  if (x === changes.x && y === changes.y && z === changes.z && changes.greatestDir === greatestDir) changed = false;
   changes.x = x;
   changes.y = y;
   changes.z = z;
   changes.greatestDir = greatestDir;
   
-  let i, j, k, l, indices, r0, r1;
-  // loop from back to front in greatest 'v' direction's magnitude
-  if ((!blocksPos.reversed && greatestMag < 0) || (blocksPos.reversed && greatestMag >= 0)) {
-    blocksPos.reverse();
-    blocksPos.reversed = !blocksPos.reversed;
-  }
-  for (i in blocksPos) {
-    // loop based on rectilinear distance
-    r0 = 0;
-    while (r0++ < 2) {
-      for (j in blocksPos[i]) {
-        if (blocksPos[i].reversed ? (+j <= otherPos[1]) : (+j > otherPos[1])) break;
-        r1 = 0;
-        while (r1++ < 2) {
-          for (k in blocksPos[i][j]) {
-            if (blocksPos[i][j].reversed ? (+k <= otherPos[1]) : (+k > otherPos[1])) break;
-            for (l in blocksPos[i][j][k]) {
-              yield blocksPos[i][j][k][l];
-            }
-          }
-          blocksPos[i][j].reverse();
-          blocksPos[i][j].reversed = !blocksPos[i][j].reversed;
-        }
-      }
-      blocksPos[i].reverse();
-      blocksPos[i].reversed = !blocksPos[i][j].reversed;
-    }
-  }
-  
+  return [ x, y, z, greatestDir, greatestMag, changed ];
 };
 
-ChunkMeshAlpha.prototype.updateIndices = function(camera) {
-  const rx = camera.rotation[0],
-        ry = camera.rotation[1],
-        vx = Math.sin(ry) * Math.cos(rx),
-        vy = Math.sin(rx),
-        vz = Math.cos(ry) * Math.cos(rx);
+ChunkMeshAlpha.prototype.updateIndices = function(x, y, z, greatestDir, greatestMag, changed) {
+  if (!changed && !this.update) return;
   
-  const indicesIterator = this.makeIndicesIterator(camera.x, camera.y, camera.z, vx, vy, vz);
-  if (indicesIterator === -1) return;
+  const blocksPos = this['blocks' + greatestDir],
+        otherPos = greatestDir === 'X' ? [ y - this.y * 32, z - this.z * 32 ] : greatestDir === 'Y' ? [ z - this.z * 32, x - this.x * 32 ] : [ x - this.x * 32, y - this.y * 32 ];  
   
-  this.indices = this.indicesIterator();
-  this.indices.length = this.indicesLength;
+  this.indices = new Uint32Array(this.indicesLength);
+  let i, j, k, l, index = 0;
+  // loop from back to front in greatest 'v' direction's magnitude
+  let reversed = false;
+  if (greatestMag < 0) {
+    blocksPos.reverse();
+    reversed = true;
+  }
+  for (i = 0; i < blocksPos.length; i ++) {
+    // loop based on rectilinear distance
+    for (j = 1; j < blocksPos[i].length; j ++) {
+      if (blocksPos[i][j][0] >= otherPos[0]) break;
+      for (k = 1; k < blocksPos[i][j].length; k ++) {
+        if (blocksPos[i][j][k][0] >= otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+      for (k = blocksPos[i][j].length - 1; k >= 1; k --) {
+        if (blocksPos[i][j][k][0] < otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+    }
+    for (j = blocksPos[i].length - 1; j >= 1; j --) {
+      if (blocksPos[i][j][0] < otherPos[0]) break;
+      for (k = 1; k < blocksPos[i][j].length; k ++) {
+        if (blocksPos[i][j][k][0] >= otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+      for (k = blocksPos[i][j].length - 1; k >= 1; k --) {
+        if (blocksPos[i][j][k][0] < otherPos[1]) break;
+        for (l = 0; l < blocksPos[i][j][k][1].length; l ++) {
+          this.indices[index ++] = blocksPos[i][j][k][1][l];
+        }
+      }
+    }
+  }
+  if (reversed) blocksPos.reverse();
   
-  // update indices buffer
+  if (this.update) return;
   const gl = this.gl;
   gl.bindVertexArray(this.vao);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(this.indices), gl.DYNAMIC_DRAW);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, this.indices, gl.DYNAMIC_DRAW);
+  delete this.indices;
 };
 
 ChunkMeshAlpha.prototype.updateBlocksPos = function(x, y, z, add, indices) {
-  let p, 
+  let p, i, j, k,
       bp0, bp1, bp2, // x/y/z, y/z/x, z/x/y
       blocksPos;     // X,     Y,     Z
   for (p = 0; p < 3; p ++) {
@@ -546,23 +612,37 @@ ChunkMeshAlpha.prototype.updateBlocksPos = function(x, y, z, add, indices) {
     bp1 = p === 0 ? y : p === 1 ? z : x;
     bp2 = p === 0 ? z : p === 1 ? x : y;
     blocksPos = this['blocks' + 'XYZ'[p]];
+    
+    for (i = 0; i < blocksPos.length; i ++) {
+      if (bp0 <= blocksPos[i][0]) break;
+    }
+    if (add && bp0 !== blocksPos[i]?.[0]) blocksPos.splice(i, 0, [bp0]);
+    
+    for (j = 1; j < blocksPos[i].length; j ++) {
+      if (bp1 <= blocksPos[i][j][0]) break;
+    }
+    if (add && bp1 !== blocksPos[i][j]?.[0]) blocksPos[i].splice(j, 0, [bp1]);
+    
+    for (k = 1; k < blocksPos[i][j].length; k ++) {
+      if (bp2 <= blocksPos[i][j][k]?.[0]) break;
+    }
+        
     if (add) {
-      if (!blocksPos[bp0]) blocksPos[bp0] = [];
-      if (!blocksPos[bp0][bp1]) blocksPos[bp0][bp1] = [];
-      blocksPos[bp0][bp1][bp2] = indices;
+      blocksPos[i][j].splice(k, 0, [bp2, indices]);
     } else {
-      delete blocksPos[bp0][bp1][bp2];
-      if (blocksPos[bp0][bp1].reduce(x => x + 1, 0) === 0) delete blocksPos[bp0][bp1];
-      if (blocksPos[bp0].reduce(x => x + 1, 0) === 0) delete blocksPos[bp0];
+      blocksPos[i][j].splice(k, 1);
+      if (blocksPos[i][j].length === 1) blocksPos[i].splice(j, 1);
+      if (blocksPos[i].length === 1) blocksPos.splice(i, 1);
     }
   }
 };
 
 ChunkMeshAlpha.prototype.updateBlocks = function(x, y, z, a, b, c, d, add) {
+  const pos = x + ',' + y + ',' + z;
   if (add) {
-    let indices = this.blocksX?.[x]?.[y]?.[z];
+    let indices = this.blocksData[pos];
     if (indices === undefined) {
-      indices = []; // list of indices
+      indices = this.blocksData[pos] = []; // list of indices
       this.updateBlocksPos(x, y, z, true, indices);
     }
     indices.push(
@@ -571,7 +651,7 @@ ChunkMeshAlpha.prototype.updateBlocks = function(x, y, z, a, b, c, d, add) {
     );
     this.indicesLength += 6;
   } else {
-    let indices = this.blocksX[x][y][z], i, data;
+    let indices = this.blocksData[pos], i, data;
     for (i = 0; i < indices.length; i += 6) {
       if (a === indices[i] && b === indices[i + 1] && c === indices[i + 2] && d === indices[i + 4]) {
         indices.splice(i, 6);
@@ -581,6 +661,7 @@ ChunkMeshAlpha.prototype.updateBlocks = function(x, y, z, a, b, c, d, add) {
     }
     if (indices.length === 0) {
       this.updateBlocksPos(x, y, z, false);
+      delete this.blocksData[pos];
     }
   }
 };
@@ -615,153 +696,13 @@ ChunkMeshAlpha.prototype.removeFace = function(facePosition, x, y, z) {
 };
 
 
-/** ./src/client/graphics/chunkMeshAlpha2.js **/
+/** ./src/client/graphics/chunkMeshWater.js **/
 
-extend(ChunkMeshAlpha2, ChunkMesh);
-function ChunkMeshAlpha2(...args) {
+extend(ChunkMeshWater, ChunkMesh);
+function ChunkMeshWater(...args) {
   this.__super__.constructor.call(this, ...args);
-  
-  // sorted indices
-  this.indicesData = new Map();
-  this.indicesLength = 0;
-  //this.indices = this.makeIndicesIterator();
 }
 
-ChunkMeshAlpha2.prototype.load = function() {
-  this.indices = this.makeIndicesIterator();
-  this.__super__.load.call(this);
-};
-
-ChunkMeshAlpha2.prototype.updateBuffers = function() {
-  this.indices = this.makeIndicesIterator();
-  this.__super__.updateBuffers.call(this);
-};
-
-ChunkMeshAlpha2.prototype.updateIndexBuffer = function() {
-  const gl = this.gl;
-  gl.bindVertexArray(this.vao);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(this.makeIndicesIterator()), gl.DYNAMIC_DRAW);
-};
-
-ChunkMeshAlpha2.prototype.makeIndicesIterator = function*() {
-  for (let [k, indexData] of this.indicesData) {
-    for (let d in indexData.data) {
-      yield indexData.data[d][0];
-      yield indexData.data[d][1];
-      yield indexData.data[d][2];
-      yield indexData.data[d][3];
-      yield indexData.data[d][4];
-      yield indexData.data[d][5];
-    }
-  }
-  this.indices.length = this.indicesLength;
-};
-
-ChunkMeshAlpha2.prototype.updateIndices = function(x, y, z, a, b, c, d, add) {
-  const pos = x + ',' + y + ',' + z;
-  if (this.indicesData.get(pos) === undefined) this.indicesData.set(pos, { pos: [x, y, z], data: [] });
-  const indexData = this.indicesData.get(pos);
-
-  if (add) {
-    indexData.data.push([
-      a, b, c, 
-      c, d, a
-    ]);
-    this.indicesLength += 6;
-  } else {
-    for (let i in indexData.data) {
-      let data = indexData.data[i];
-      if (a === data[0] && b === data[1] && c === data[2] && d === data[4]) {
-        indexData.data.splice(i, 1);
-        this.indicesLength -= 6;
-        break;
-      }
-    }
-    if (indexData.data.length === 0) this.indicesData.delete(pos); 
-  }
-};
-
-function temp(x, y, z, a, b, c, d, add) {
-  const pos = x + ',' + y + ',' + z,
-        indicesData = this.indicesData;
-  if (this.blocksX?.[x]?.[y]?.[z] === undefined) {
-    indicesData.set(pos, { pos: [x, y, z], data: [] });
-    this.updateBlocksPos(x, y, z, true);
-  }
-  const indexData = indicesData.get(pos);
-
-  if (add) {
-    indexData.data.push([
-      a, b, c, 
-      c, d, a
-    ]);
-    this.indicesLength += 6;
-  } else {
-    for (let i in indexData.data) {
-      let data = indexData.data[i];
-      if (a === data[0] && b === data[1] && c === data[2] && d === data[4]) {
-        indexData.data.splice(i, 1);
-        this.indicesLength -= 6;
-        break;
-      }
-    }
-    if (indexData.data.length === 0) {
-      indicesData.delete(pos);
-      this.updateBlocksPos(x, y, z, false);
-    }
-  }
-}
-
-ChunkMeshAlpha2.prototype.addCubeFace = function(x, y, z, dir, texture) {
-  const pos = this.cubeFacePosition(x, y, z, dir),
-        texcoord = this.cubeFaceTexcoord([2, 3, 0, 0, 3, 2][dir]),
-        dLight = [1, 1, 3, 0, 2, 2][dir]; // directional lighting
-
-  let vertexIndex = -4;
-  if (this.vertexSlots.length > 0) {
-    vertexIndex = this.vertexSlots[this.vertexSlots.length - 1];
-    this.vertexSlots.pop();
-  }
-
-  const a = this.addVertex(pos[0], pos[1], pos[2], texture, texcoord[0], texcoord[1], dLight, vertexIndex),
-        b = this.addVertex(pos[3], pos[4], pos[5], texture, texcoord[2], texcoord[3], dLight, vertexIndex + 1),
-        c = this.addVertex(pos[6], pos[7], pos[8], texture, texcoord[4], texcoord[5], dLight, vertexIndex + 2),
-        d = this.addVertex(pos[9], pos[10], pos[11], texture, texcoord[6], texcoord[7], dLight, vertexIndex + 3);
-  this.updateIndices(x, y, z, a, b, c, d, true);
-};
-
-ChunkMeshAlpha2.prototype.removeFace = function(facePosition, x, y, z) {
-  const vertexIndex = this.findFace(facePosition);
-  if (vertexIndex === -1) return;
-  this.vertex0[vertexIndex] = this.vertex0[vertexIndex + 1] = this.vertex0[vertexIndex + 2] = this.vertex0[vertexIndex + 3] = NaN;
-  this.vertex1[vertexIndex] = this.vertex1[vertexIndex + 1] = this.vertex1[vertexIndex + 2] = this.vertex1[vertexIndex + 3] = NaN;
-  this.updateIndices(x, y, z, vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex + 3, false);
-  
-  this.vertexSlots.push(vertexIndex);
-  this.update = true;
-};
-
-ChunkMeshAlpha2.prototype.sort = function(camera) {
-  const x = camera.x, y = camera.y, z = camera.z,
-        rx = camera.rotation[0],
-        ry = camera.rotation[1],
-        vx = Math.sin(ry) * Math.cos(rx),
-        vy = Math.sin(rx),
-        vz = Math.cos(ry) * Math.cos(rx);
-  
-  //console.log([Math.round(vx * 100) / 100, Math.round(vy * 100) / 100, Math.round(vz * 100) / 100])
-
-  // insertion sort
-  this.indicesData.forEach(t => {
-    t.dotp = (t.pos[0] + 0.5 - x) * vx + (t.pos[1] + 0.5 - y) * vy + (t.pos[2] + 0.5 - z) * vz;
-    //let px = Math.abs(t.pos[0] - x + 0.5), py = Math.abs(t.pos[1] - y + 0.5), pz = Math.abs(t.pos[2] - z + 0.5);
-    //t.dotp = -(px * px + py * py + pz * pz);
-  });
-  this.indicesData = new Map([...this.indicesData].sort((a, b) => a[1].dotp - b[1].dotp));
-  
-  this.updateIndexBuffer();
-};
 
 
 /** ./src/client/graphics/matrix.js **/
@@ -1107,6 +1048,12 @@ function Textures() {
     red_glass: [[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,0,1,1,1,1,1,1,1,1,1,1,0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[[255,56,56,204],[255,56,56,77]]],
     green_glass: [[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,0,1,1,1,1,1,1,1,1,1,1,0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[[31,200,82,204],[30,199,83,77]]],
     blue_glass: [[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,0,1,1,1,1,1,1,1,1,1,1,0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[[57,42,255,204],[56,43,255,77]]],
+    sand: [[0,0,0,1,0,0,0,2,0,0,0,0,0,0,2,3,0,0,3,0,0,4,2,0,5,1,1,0,2,2,3,3,0,5,1,0,4,4,2,3,5,1,0,4,2,3,5,1,0,1,2,4,2,0,3,3,1,0,4,4,0,5,1,2,0,0,4,2,0,3,5,1,0,0,4,2,5,1,2,4,0,2,0,5,5,1,1,1,0,4,2,1,0,2,4,4,4,0,5,5,1,1,2,0,0,0,0,0,0,2,4,2,0,0,1,1,1,2,2,0,3,1,1,0,0,4,2,0,0,1,0,0,2,0,3,3,5,1,0,0,2,5,0,2,0,0,4,0,0,3,5,1,1,0,2,0,5,1,2,4,2,4,2,0,5,1,1,1,0,2,0,5,3,1,2,0,4,4,0,5,5,1,1,0,4,0,5,3,1,1,0,0,2,0,0,5,1,0,2,4,4,0,1,1,1,0,0,5,0,0,1,1,0,0,4,2,5,1,0,0,2,2,5,1,0,2,4,2,0,2,2,5,1,0,0,4,2,1,1,0,3,2,2,0,0,0,1,1,0,0,4,2,0,0,0,2],[[217,190,119,255],[217,184,103,255],[220,195,127,255],[201,170,91,255],[228,202,133,255],[211,178,95,255]]],
+    log_side: [[0,1,2,3,3,0,2,0,4,1,0,3,3,0,5,3,0,3,6,0,3,0,6,1,3,1,2,0,3,2,0,3,0,3,6,0,3,0,2,1,3,1,2,1,3,2,0,1,1,3,2,0,0,5,6,3,3,0,6,1,3,6,3,1,1,0,0,2,1,0,1,3,3,0,2,1,1,6,3,1,2,0,0,2,1,3,0,3,3,2,0,0,1,2,3,0,6,3,0,6,0,3,2,3,0,2,0,2,0,0,2,0,0,3,1,2,0,3,6,3,0,6,1,5,2,0,2,0,0,3,1,0,3,3,2,3,1,6,1,0,6,5,2,0,0,6,1,5,3,1,2,0,1,6,1,3,2,0,2,3,3,2,3,0,3,1,6,5,3,2,0,3,0,3,6,3,3,2,3,0,2,1,6,0,3,3,0,3,0,3,6,0,0,6,3,5,6,0,2,2,0,6,3,0,1,3,2,1,0,2,3,0,2,0,3,2,0,6,3,2,1,0,3,1,1,0,3,3,2,0,3,0,4,2,0,6,1,1,2,1,3,3,0,3,4,0,2,1,3,3,3,2,0,1,0,0],[[133,109,66,255],[124,103,64,255],[82,67,40,255],[115,94,58,255],[153,125,76,255],[143,117,71,255],[92,75,42,255]]],
+    log_top: [[0,0,1,1,0,1,1,2,2,1,0,1,1,0,1,1,2,1,0,1,3,3,4,5,3,3,3,3,1,1,2,1,2,1,3,3,3,6,6,6,7,7,6,3,5,5,2,0,1,1,3,6,7,5,5,3,3,3,3,6,6,5,1,2,2,3,3,6,3,3,3,3,3,5,5,3,7,3,3,2,1,3,6,3,3,3,7,7,6,6,5,3,5,6,3,1,2,3,7,3,5,6,3,3,3,3,6,3,3,6,5,1,1,3,7,3,3,6,3,7,6,3,7,3,3,6,5,1,2,8,6,3,3,7,3,6,7,3,7,3,5,7,5,0,0,8,6,5,3,7,3,3,3,5,6,3,5,7,3,2,1,3,7,5,3,3,6,7,6,6,3,3,3,6,3,1,1,3,3,7,3,5,3,3,3,5,3,3,6,3,3,1,2,1,3,6,6,3,5,5,3,3,3,7,6,3,1,2,0,1,3,3,3,6,6,7,7,6,6,5,3,3,1,2,1,0,2,1,3,5,4,3,3,3,5,5,2,1,2,1,0,1,0,0,1,0,1,2,2,1,1,0,0,1,1,0],[[133,109,66,255],[115,94,58,255],[124,103,64,255],[167,140,88,255],[177,154,108,255],[172,147,98,255],[154,128,78,255],[145,119,70,255],[178,154,108,255]]],
+    marble: [[0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,1,1,0,0,0,1,1,1,0,0,0,0,0,1,1,2,2,2,0,0,2,2,2,2,1,1,1,0,0,0,0,0,0,0,0,2,2,2,3,3,2,2,2,2,2,2,1,1,1,0,0,0,0,1,1,1,1,3,3,3,3,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,2,2,2,2,2,1,0,0,0,1,2,2,2,2,1,0,0,1,2,3,3,2,2,1,2,2,3,3,3,2,2,1,1,0,0,1,2,2,1,0,1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,2,2,3,2,2,1,0,0,1,1,1,1,0,0,0,0,0,2,2,0,0,0,0,0,0,0],[[191,191,175,255],[185,185,170,255],[179,180,164,255],[174,174,155,255]]],
+    tainted_marble: [[0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,1,1,0,0,0,1,1,1,0,0,0,0,0,1,1,2,2,2,0,0,2,2,2,2,1,1,1,0,0,0,0,0,0,0,0,2,2,2,3,3,2,2,2,2,2,2,1,1,1,0,0,0,0,1,1,1,1,3,3,3,3,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,2,2,2,2,2,1,0,0,0,1,2,2,2,2,1,0,0,1,2,3,3,2,2,1,2,2,3,3,3,2,2,1,1,0,0,1,2,2,1,0,1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,2,2,3,2,2,1,0,0,1,1,1,1,0,0,0,0,0,2,2,0,0,0,0,0,0,0],[[189,189,114,255],[185,185,110,255],[181,181,108,255],[176,176,103,255]]],
+    jungle_marble: [[0,0,0,1,1,2,2,2,2,2,2,1,2,2,0,0,0,3,3,4,2,4,4,4,2,2,4,2,4,3,3,0,0,3,1,1,1,1,2,2,2,2,2,1,1,1,4,1,0,4,1,3,4,2,2,2,4,4,4,3,3,1,4,1,0,2,1,3,1,2,2,2,2,2,1,1,4,1,2,2,0,2,1,4,2,2,2,2,2,2,2,1,4,1,4,2,1,2,1,2,2,2,2,1,1,2,2,2,2,1,4,2,1,4,2,4,2,2,1,1,1,1,2,2,2,2,4,1,1,4,2,2,2,2,1,1,1,1,2,2,4,2,2,1,2,4,2,4,2,2,2,1,1,2,2,2,2,2,2,0,2,2,1,4,1,2,2,2,2,2,2,2,4,1,4,0,2,2,1,4,1,2,2,2,2,2,1,1,3,1,2,0,2,4,1,3,4,2,4,4,4,2,4,4,3,1,4,2,2,2,1,1,2,1,1,1,2,2,1,1,1,1,3,2,1,3,3,4,2,2,4,4,2,2,4,4,4,3,3,0,0,0,0,0,1,1,1,2,2,2,2,1,1,0,0,0],[[131,195,107,255],[125,187,102,255],[128,181,108,255],[115,168,95,255],[120,174,100,255]]]
   };
   this.textureIDs = [];
   this.textureKeys = {};
@@ -1172,12 +1119,11 @@ Textures.prototype.createTextureArray = function(gl) {
     for (let x = -4; x < 4; x ++) {
       for (let y = -1; y < 3; y ++) {
         for (let z = -4; z < 4; z ++) {
-          //sim.generateChunk(x, y, z);
+          sim.generateChunk(x, y, z);
         }
       }
     }
-    sim.generateChunk(0, 0, 0);
-    //sim.generateChunk(0, -1, 0);
+    //sim.generateChunk(0, 0, 0);
     
     sim.spawnPlayer();
     initControls(); // TEMP
@@ -1214,6 +1160,8 @@ function initControls() {
     17: 'lock'     // ctrl
   };
   let input = Object.fromEntries(Object.entries(keymap).map(a => [a[1], false]));
+  let leftMouse = false;
+  let rightMouse = false;
   
   sim.world.player.tick = function() {    
     const speed = 0.05;
@@ -1228,6 +1176,10 @@ function initControls() {
     this.moveX(vx);
     this.moveY(vy);
     this.moveZ(vz);
+    
+    if (sim.ticks % 5 !== 0) return;
+    if (leftMouse) sim.world.player.breakBlock();
+    if (rightMouse) sim.world.player.placeBlock();
   };
   
   // event listeners
@@ -1243,9 +1195,17 @@ function initControls() {
   
   window.addEventListener('mousedown', e => {
     if (event.button === 2) {
-      sim.world.player.placeBlock();
+      rightMouse = true;
     } else if (event.button === 0) {
-      sim.world.player.breakBlock();
+      leftMouse = true;
+    }
+  });
+  
+  window.addEventListener('mouseup', e => {
+    if (event.button === 2) {
+      rightMouse = false;
+    } else if (event.button === 0) {
+      leftMouse = false;
     }
   });
 
@@ -1259,6 +1219,478 @@ function initControls() {
   });
  
 };
+
+
+/** ./src/libs/simplex.js **/
+
+/*
+ * A fast javascript implementation of simplex noise by Jonas Wagner
+
+Based on a speed-improved simplex noise algorithm for 2D, 3D and 4D in Java.
+Which is based on example code by Stefan Gustavson (stegu@itn.liu.se).
+With Optimisations by Peter Eastman (peastman@drizzle.stanford.edu).
+Better rank ordering method by Stefan Gustavson in 2012.
+
+ Copyright (c) 2018 Jonas Wagner
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+ */
+let [SimplexNoise, Alea] = (function() {
+  'use strict';
+
+  var F2 = 0.5 * (Math.sqrt(3.0) - 1.0);
+  var G2 = (3.0 - Math.sqrt(3.0)) / 6.0;
+  var F3 = 1.0 / 3.0;
+  var G3 = 1.0 / 6.0;
+  var F4 = (Math.sqrt(5.0) - 1.0) / 4.0;
+  var G4 = (5.0 - Math.sqrt(5.0)) / 20.0;
+
+  function SimplexNoise(randomOrSeed) {
+    var random;
+    if (typeof randomOrSeed == 'function') {
+      random = randomOrSeed;
+    }
+    else if (randomOrSeed) {
+      random = alea(randomOrSeed);
+    } else {
+      random = Math.random;
+    }
+    this.p = buildPermutationTable(random);
+    this.perm = new Uint8Array(512);
+    this.permMod12 = new Uint8Array(512);
+    for (var i = 0; i < 512; i++) {
+      this.perm[i] = this.p[i & 255];
+      this.permMod12[i] = this.perm[i] % 12;
+    }
+
+  }
+  SimplexNoise.prototype = {
+    grad3: new Float32Array([1, 1, 0,
+      -1, 1, 0,
+      1, -1, 0,
+
+      -1, -1, 0,
+      1, 0, 1,
+      -1, 0, 1,
+
+      1, 0, -1,
+      -1, 0, -1,
+      0, 1, 1,
+
+      0, -1, 1,
+      0, 1, -1,
+      0, -1, -1]),
+    grad4: new Float32Array([0, 1, 1, 1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1, -1, -1,
+      0, -1, 1, 1, 0, -1, 1, -1, 0, -1, -1, 1, 0, -1, -1, -1,
+      1, 0, 1, 1, 1, 0, 1, -1, 1, 0, -1, 1, 1, 0, -1, -1,
+      -1, 0, 1, 1, -1, 0, 1, -1, -1, 0, -1, 1, -1, 0, -1, -1,
+      1, 1, 0, 1, 1, 1, 0, -1, 1, -1, 0, 1, 1, -1, 0, -1,
+      -1, 1, 0, 1, -1, 1, 0, -1, -1, -1, 0, 1, -1, -1, 0, -1,
+      1, 1, 1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1, -1, -1, 0,
+      -1, 1, 1, 0, -1, 1, -1, 0, -1, -1, 1, 0, -1, -1, -1, 0]),
+    noise2D: function(xin, yin) {
+      var permMod12 = this.permMod12;
+      var perm = this.perm;
+      var grad3 = this.grad3;
+      var n0 = 0; // Noise contributions from the three corners
+      var n1 = 0;
+      var n2 = 0;
+      // Skew the input space to determine which simplex cell we're in
+      var s = (xin + yin) * F2; // Hairy factor for 2D
+      var i = Math.floor(xin + s);
+      var j = Math.floor(yin + s);
+      var t = (i + j) * G2;
+      var X0 = i - t; // Unskew the cell origin back to (x,y) space
+      var Y0 = j - t;
+      var x0 = xin - X0; // The x,y distances from the cell origin
+      var y0 = yin - Y0;
+      // For the 2D case, the simplex shape is an equilateral triangle.
+      // Determine which simplex we are in.
+      var i1, j1; // Offsets for second (middle) corner of simplex in (i,j) coords
+      if (x0 > y0) {
+        i1 = 1;
+        j1 = 0;
+      } // lower triangle, XY order: (0,0)->(1,0)->(1,1)
+      else {
+        i1 = 0;
+        j1 = 1;
+      } // upper triangle, YX order: (0,0)->(0,1)->(1,1)
+      // A step of (1,0) in (i,j) means a step of (1-c,-c) in (x,y), and
+      // a step of (0,1) in (i,j) means a step of (-c,1-c) in (x,y), where
+      // c = (3-sqrt(3))/6
+      var x1 = x0 - i1 + G2; // Offsets for middle corner in (x,y) unskewed coords
+      var y1 = y0 - j1 + G2;
+      var x2 = x0 - 1.0 + 2.0 * G2; // Offsets for last corner in (x,y) unskewed coords
+      var y2 = y0 - 1.0 + 2.0 * G2;
+      // Work out the hashed gradient indices of the three simplex corners
+      var ii = i & 255;
+      var jj = j & 255;
+      // Calculate the contribution from the three corners
+      var t0 = 0.5 - x0 * x0 - y0 * y0;
+      if (t0 >= 0) {
+        var gi0 = permMod12[ii + perm[jj]] * 3;
+        t0 *= t0;
+        n0 = t0 * t0 * (grad3[gi0] * x0 + grad3[gi0 + 1] * y0); // (x,y) of grad3 used for 2D gradient
+      }
+      var t1 = 0.5 - x1 * x1 - y1 * y1;
+      if (t1 >= 0) {
+        var gi1 = permMod12[ii + i1 + perm[jj + j1]] * 3;
+        t1 *= t1;
+        n1 = t1 * t1 * (grad3[gi1] * x1 + grad3[gi1 + 1] * y1);
+      }
+      var t2 = 0.5 - x2 * x2 - y2 * y2;
+      if (t2 >= 0) {
+        var gi2 = permMod12[ii + 1 + perm[jj + 1]] * 3;
+        t2 *= t2;
+        n2 = t2 * t2 * (grad3[gi2] * x2 + grad3[gi2 + 1] * y2);
+      }
+      // Add contributions from each corner to get the final noise value.
+      // The result is scaled to return values in the interval [-1,1].
+      return 70.0 * (n0 + n1 + n2);
+    },
+    // 3D simplex noise
+    noise3D: function(xin, yin, zin) {
+      var permMod12 = this.permMod12;
+      var perm = this.perm;
+      var grad3 = this.grad3;
+      var n0, n1, n2, n3; // Noise contributions from the four corners
+      // Skew the input space to determine which simplex cell we're in
+      var s = (xin + yin + zin) * F3; // Very nice and simple skew factor for 3D
+      var i = Math.floor(xin + s);
+      var j = Math.floor(yin + s);
+      var k = Math.floor(zin + s);
+      var t = (i + j + k) * G3;
+      var X0 = i - t; // Unskew the cell origin back to (x,y,z) space
+      var Y0 = j - t;
+      var Z0 = k - t;
+      var x0 = xin - X0; // The x,y,z distances from the cell origin
+      var y0 = yin - Y0;
+      var z0 = zin - Z0;
+      // For the 3D case, the simplex shape is a slightly irregular tetrahedron.
+      // Determine which simplex we are in.
+      var i1, j1, k1; // Offsets for second corner of simplex in (i,j,k) coords
+      var i2, j2, k2; // Offsets for third corner of simplex in (i,j,k) coords
+      if (x0 >= y0) {
+        if (y0 >= z0) {
+          i1 = 1;
+          j1 = 0;
+          k1 = 0;
+          i2 = 1;
+          j2 = 1;
+          k2 = 0;
+        } // X Y Z order
+        else if (x0 >= z0) {
+          i1 = 1;
+          j1 = 0;
+          k1 = 0;
+          i2 = 1;
+          j2 = 0;
+          k2 = 1;
+        } // X Z Y order
+        else {
+          i1 = 0;
+          j1 = 0;
+          k1 = 1;
+          i2 = 1;
+          j2 = 0;
+          k2 = 1;
+        } // Z X Y order
+      }
+      else { // x0<y0
+        if (y0 < z0) {
+          i1 = 0;
+          j1 = 0;
+          k1 = 1;
+          i2 = 0;
+          j2 = 1;
+          k2 = 1;
+        } // Z Y X order
+        else if (x0 < z0) {
+          i1 = 0;
+          j1 = 1;
+          k1 = 0;
+          i2 = 0;
+          j2 = 1;
+          k2 = 1;
+        } // Y Z X order
+        else {
+          i1 = 0;
+          j1 = 1;
+          k1 = 0;
+          i2 = 1;
+          j2 = 1;
+          k2 = 0;
+        } // Y X Z order
+      }
+      // A step of (1,0,0) in (i,j,k) means a step of (1-c,-c,-c) in (x,y,z),
+      // a step of (0,1,0) in (i,j,k) means a step of (-c,1-c,-c) in (x,y,z), and
+      // a step of (0,0,1) in (i,j,k) means a step of (-c,-c,1-c) in (x,y,z), where
+      // c = 1/6.
+      var x1 = x0 - i1 + G3; // Offsets for second corner in (x,y,z) coords
+      var y1 = y0 - j1 + G3;
+      var z1 = z0 - k1 + G3;
+      var x2 = x0 - i2 + 2.0 * G3; // Offsets for third corner in (x,y,z) coords
+      var y2 = y0 - j2 + 2.0 * G3;
+      var z2 = z0 - k2 + 2.0 * G3;
+      var x3 = x0 - 1.0 + 3.0 * G3; // Offsets for last corner in (x,y,z) coords
+      var y3 = y0 - 1.0 + 3.0 * G3;
+      var z3 = z0 - 1.0 + 3.0 * G3;
+      // Work out the hashed gradient indices of the four simplex corners
+      var ii = i & 255;
+      var jj = j & 255;
+      var kk = k & 255;
+      // Calculate the contribution from the four corners
+      var t0 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0;
+      if (t0 < 0) n0 = 0.0;
+      else {
+        var gi0 = permMod12[ii + perm[jj + perm[kk]]] * 3;
+        t0 *= t0;
+        n0 = t0 * t0 * (grad3[gi0] * x0 + grad3[gi0 + 1] * y0 + grad3[gi0 + 2] * z0);
+      }
+      var t1 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1;
+      if (t1 < 0) n1 = 0.0;
+      else {
+        var gi1 = permMod12[ii + i1 + perm[jj + j1 + perm[kk + k1]]] * 3;
+        t1 *= t1;
+        n1 = t1 * t1 * (grad3[gi1] * x1 + grad3[gi1 + 1] * y1 + grad3[gi1 + 2] * z1);
+      }
+      var t2 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2;
+      if (t2 < 0) n2 = 0.0;
+      else {
+        var gi2 = permMod12[ii + i2 + perm[jj + j2 + perm[kk + k2]]] * 3;
+        t2 *= t2;
+        n2 = t2 * t2 * (grad3[gi2] * x2 + grad3[gi2 + 1] * y2 + grad3[gi2 + 2] * z2);
+      }
+      var t3 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3;
+      if (t3 < 0) n3 = 0.0;
+      else {
+        var gi3 = permMod12[ii + 1 + perm[jj + 1 + perm[kk + 1]]] * 3;
+        t3 *= t3;
+        n3 = t3 * t3 * (grad3[gi3] * x3 + grad3[gi3 + 1] * y3 + grad3[gi3 + 2] * z3);
+      }
+      // Add contributions from each corner to get the final noise value.
+      // The result is scaled to stay just inside [-1,1]
+      return 32.0 * (n0 + n1 + n2 + n3);
+    },
+    // 4D simplex noise, better simplex rank ordering method 2012-03-09
+    noise4D: function(x, y, z, w) {
+      var perm = this.perm;
+      var grad4 = this.grad4;
+
+      var n0, n1, n2, n3, n4; // Noise contributions from the five corners
+      // Skew the (x,y,z,w) space to determine which cell of 24 simplices we're in
+      var s = (x + y + z + w) * F4; // Factor for 4D skewing
+      var i = Math.floor(x + s);
+      var j = Math.floor(y + s);
+      var k = Math.floor(z + s);
+      var l = Math.floor(w + s);
+      var t = (i + j + k + l) * G4; // Factor for 4D unskewing
+      var X0 = i - t; // Unskew the cell origin back to (x,y,z,w) space
+      var Y0 = j - t;
+      var Z0 = k - t;
+      var W0 = l - t;
+      var x0 = x - X0; // The x,y,z,w distances from the cell origin
+      var y0 = y - Y0;
+      var z0 = z - Z0;
+      var w0 = w - W0;
+      // For the 4D case, the simplex is a 4D shape I won't even try to describe.
+      // To find out which of the 24 possible simplices we're in, we need to
+      // determine the magnitude ordering of x0, y0, z0 and w0.
+      // Six pair-wise comparisons are performed between each possible pair
+      // of the four coordinates, and the results are used to rank the numbers.
+      var rankx = 0;
+      var ranky = 0;
+      var rankz = 0;
+      var rankw = 0;
+      if (x0 > y0) rankx++;
+      else ranky++;
+      if (x0 > z0) rankx++;
+      else rankz++;
+      if (x0 > w0) rankx++;
+      else rankw++;
+      if (y0 > z0) ranky++;
+      else rankz++;
+      if (y0 > w0) ranky++;
+      else rankw++;
+      if (z0 > w0) rankz++;
+      else rankw++;
+      var i1, j1, k1, l1; // The integer offsets for the second simplex corner
+      var i2, j2, k2, l2; // The integer offsets for the third simplex corner
+      var i3, j3, k3, l3; // The integer offsets for the fourth simplex corner
+      // simplex[c] is a 4-vector with the numbers 0, 1, 2 and 3 in some order.
+      // Many values of c will never occur, since e.g. x>y>z>w makes x<z, y<w and x<w
+      // impossible. Only the 24 indices which have non-zero entries make any sense.
+      // We use a thresholding to set the coordinates in turn from the largest magnitude.
+      // Rank 3 denotes the largest coordinate.
+      i1 = rankx >= 3 ? 1 : 0;
+      j1 = ranky >= 3 ? 1 : 0;
+      k1 = rankz >= 3 ? 1 : 0;
+      l1 = rankw >= 3 ? 1 : 0;
+      // Rank 2 denotes the second largest coordinate.
+      i2 = rankx >= 2 ? 1 : 0;
+      j2 = ranky >= 2 ? 1 : 0;
+      k2 = rankz >= 2 ? 1 : 0;
+      l2 = rankw >= 2 ? 1 : 0;
+      // Rank 1 denotes the second smallest coordinate.
+      i3 = rankx >= 1 ? 1 : 0;
+      j3 = ranky >= 1 ? 1 : 0;
+      k3 = rankz >= 1 ? 1 : 0;
+      l3 = rankw >= 1 ? 1 : 0;
+      // The fifth corner has all coordinate offsets = 1, so no need to compute that.
+      var x1 = x0 - i1 + G4; // Offsets for second corner in (x,y,z,w) coords
+      var y1 = y0 - j1 + G4;
+      var z1 = z0 - k1 + G4;
+      var w1 = w0 - l1 + G4;
+      var x2 = x0 - i2 + 2.0 * G4; // Offsets for third corner in (x,y,z,w) coords
+      var y2 = y0 - j2 + 2.0 * G4;
+      var z2 = z0 - k2 + 2.0 * G4;
+      var w2 = w0 - l2 + 2.0 * G4;
+      var x3 = x0 - i3 + 3.0 * G4; // Offsets for fourth corner in (x,y,z,w) coords
+      var y3 = y0 - j3 + 3.0 * G4;
+      var z3 = z0 - k3 + 3.0 * G4;
+      var w3 = w0 - l3 + 3.0 * G4;
+      var x4 = x0 - 1.0 + 4.0 * G4; // Offsets for last corner in (x,y,z,w) coords
+      var y4 = y0 - 1.0 + 4.0 * G4;
+      var z4 = z0 - 1.0 + 4.0 * G4;
+      var w4 = w0 - 1.0 + 4.0 * G4;
+      // Work out the hashed gradient indices of the five simplex corners
+      var ii = i & 255;
+      var jj = j & 255;
+      var kk = k & 255;
+      var ll = l & 255;
+      // Calculate the contribution from the five corners
+      var t0 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0 - w0 * w0;
+      if (t0 < 0) n0 = 0.0;
+      else {
+        var gi0 = (perm[ii + perm[jj + perm[kk + perm[ll]]]] % 32) * 4;
+        t0 *= t0;
+        n0 = t0 * t0 * (grad4[gi0] * x0 + grad4[gi0 + 1] * y0 + grad4[gi0 + 2] * z0 + grad4[gi0 + 3] * w0);
+      }
+      var t1 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1 - w1 * w1;
+      if (t1 < 0) n1 = 0.0;
+      else {
+        var gi1 = (perm[ii + i1 + perm[jj + j1 + perm[kk + k1 + perm[ll + l1]]]] % 32) * 4;
+        t1 *= t1;
+        n1 = t1 * t1 * (grad4[gi1] * x1 + grad4[gi1 + 1] * y1 + grad4[gi1 + 2] * z1 + grad4[gi1 + 3] * w1);
+      }
+      var t2 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2 - w2 * w2;
+      if (t2 < 0) n2 = 0.0;
+      else {
+        var gi2 = (perm[ii + i2 + perm[jj + j2 + perm[kk + k2 + perm[ll + l2]]]] % 32) * 4;
+        t2 *= t2;
+        n2 = t2 * t2 * (grad4[gi2] * x2 + grad4[gi2 + 1] * y2 + grad4[gi2 + 2] * z2 + grad4[gi2 + 3] * w2);
+      }
+      var t3 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3 - w3 * w3;
+      if (t3 < 0) n3 = 0.0;
+      else {
+        var gi3 = (perm[ii + i3 + perm[jj + j3 + perm[kk + k3 + perm[ll + l3]]]] % 32) * 4;
+        t3 *= t3;
+        n3 = t3 * t3 * (grad4[gi3] * x3 + grad4[gi3 + 1] * y3 + grad4[gi3 + 2] * z3 + grad4[gi3 + 3] * w3);
+      }
+      var t4 = 0.6 - x4 * x4 - y4 * y4 - z4 * z4 - w4 * w4;
+      if (t4 < 0) n4 = 0.0;
+      else {
+        var gi4 = (perm[ii + 1 + perm[jj + 1 + perm[kk + 1 + perm[ll + 1]]]] % 32) * 4;
+        t4 *= t4;
+        n4 = t4 * t4 * (grad4[gi4] * x4 + grad4[gi4 + 1] * y4 + grad4[gi4 + 2] * z4 + grad4[gi4 + 3] * w4);
+      }
+      // Sum up and scale the result to cover the range [-1,1]
+      return 27.0 * (n0 + n1 + n2 + n3 + n4);
+    }
+  };
+
+  function buildPermutationTable(random) {
+    var i;
+    var p = new Uint8Array(256);
+    for (i = 0; i < 256; i++) {
+      p[i] = i;
+    }
+    for (i = 0; i < 255; i++) {
+      var r = i + ~~(random() * (256 - i));
+      var aux = p[i];
+      p[i] = p[r];
+      p[r] = aux;
+    }
+    return p;
+  }
+  SimplexNoise._buildPermutationTable = buildPermutationTable;
+
+  /*
+  The ALEA PRNG and masher code used by simplex-noise.js
+  is based on code by Johannes Baagøe, modified by Jonas Wagner.
+  See alea.md for the full license.
+  */
+  function alea() {
+    var s0 = 0;
+    var s1 = 0;
+    var s2 = 0;
+    var c = 1;
+
+    var mash = masher();
+    s0 = mash(' ');
+    s1 = mash(' ');
+    s2 = mash(' ');
+
+    for (var i = 0; i < arguments.length; i++) {
+      s0 -= mash(arguments[i]);
+      if (s0 < 0) {
+        s0 += 1;
+      }
+      s1 -= mash(arguments[i]);
+      if (s1 < 0) {
+        s1 += 1;
+      }
+      s2 -= mash(arguments[i]);
+      if (s2 < 0) {
+        s2 += 1;
+      }
+    }
+    mash = null;
+    return function() {
+      var t = 2091639 * s0 + c * 2.3283064365386963e-10; // 2^-32
+      s0 = s1;
+      s1 = s2;
+      return s2 = t - (c = t | 0);
+    };
+  }
+  function masher() {
+    var n = 0xefc8249d;
+    return function(data) {
+      data = data.toString();
+      for (var i = 0; i < data.length; i++) {
+        n += data.charCodeAt(i);
+        var h = 0.02519603282416938 * n;
+        n = h >>> 0;
+        h -= n;
+        h *= n;
+        n = h >>> 0;
+        h -= n;
+        n += h * 0x100000000; // 2^32
+      }
+      return (n >>> 0) * 2.3283064365386963e-10; // 2^-32
+    };
+  }
+
+  return [SimplexNoise, alea];
+
+})();
+
 
 
 /** ./src/server/data/blockInfo.js **/
@@ -1326,11 +1758,36 @@ const Blocks = (function() {
       isTranslucent: true,
       texture: ['green_glass', 'green_glass', 'green_glass', 'green_glass', 'green_glass', 'green_glass']
     },
+    water: {
+      shape: 'water',
+      isTranslucent: true,
+      texture: ['blue_glass', 'blue_glass', 'blue_glass', 'blue_glass', 'blue_glass', 'blue_glass'],
+    },
+    sand: {
+      shape: 'cube',
+      texture: [ 'sand', 'sand', 'sand', 'sand', 'sand', 'sand' ]
+    },
+    log: {
+      shape: 'cube',
+      texture: [ 'log_side', 'log_side', 'log_top', 'log_top', 'log_side', 'log_side' ]
+    },
+    marble: {
+      shape: 'cube',
+      texture: [ 'marble', 'marble', 'marble', 'marble', 'marble', 'marble' ]
+    },
+    tainted_marble: {
+      shape: 'cube',
+      texture: [ 'tainted_marble', 'tainted_marble', 'tainted_marble', 'tainted_marble', 'tainted_marble', 'tainted_marble' ]
+    },
+    jungle_marble: {
+      shape: 'cube',
+      texture: [ 'jungle_marble', 'jungle_marble', 'jungle_marble', 'jungle_marble', 'jungle_marble', 'jungle_marble' ]
+    }
   };
 
   for (let b in Blocks) {
     let block = Blocks[b];
-    if (block.isTranslucent) {
+    if (block.isTranslucent && !block.shader) {
       block.shader = 'alpha';
     } else {
       block.shader = 'default';
@@ -1392,7 +1849,7 @@ Entity.prototype.moveZ = function(mag) {
 extend(Player, Entity);
 function Player(...args) { // (data, world)
   this.__super__.constructor.call(this, ...args);
-  this.holding = 'red_glass';
+  this.holding = 'stone';
   this.velocity = [0, 0, 0];
   this.rotation = [0, 0, 0];
 }
@@ -1412,14 +1869,14 @@ Player.prototype.move = function() {
 
 // adds block at end of raycast
 Player.prototype.placeBlock = function(block = this.holding) {
-  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 20);
+  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 50);
   if (blocks[1] === undefined) return;
   sim.setBlock(blocks[1].x, blocks[1].y, blocks[1].z, block);
 };
 
 // removes the first block from raycast
 Player.prototype.breakBlock = function() {
-  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 20);
+  let blocks = this.world.raycast(this.x, this.y, this.z, this.rotation[0], this.rotation[1], 50);
   if (blocks[0] === undefined) return;
   sim.setBlock(blocks[0].x, blocks[0].y, blocks[0].z, 'air');
 };
@@ -1437,7 +1894,7 @@ ServerSim.init = function() {
 /** ./src/server/world/chunk.js **/
 
 function Chunk(...args) {
-  [ this.x, this.y, this.z, this.blocks, this.blockIDs, this.chunks ] = args;
+  [ this.x, this.y, this.z, this.blocks, this.blockKeys, this.chunks ] = args;
 }
 
 Chunk.posToIndex = function(x, y, z) {
@@ -1455,9 +1912,9 @@ Chunk.prototype.getBlockType = function(x, y, z) {
         tz = (z === 32) - (z === -1);
   if (tx + ty + tz !== 0) {
     const chunk = this.chunks[[ this.x + tx, this.y + ty, this.z + tz ]];
-    return this.blockIDs[chunk === undefined ? undefined : chunk.blocks[Chunk.posToIndex(tx === 0 ? x : tx === 1 ? 0 : 31, ty === 0 ? y : ty === 1 ? 0 : 31, tz === 0 ? z : tz === 1 ? 0 : 31)]];
+    return this.blockKeys[chunk === undefined ? undefined : chunk.blocks[Chunk.posToIndex(tx === 0 ? x : tx === 1 ? 0 : 31, ty === 0 ? y : ty === 1 ? 0 : 31, tz === 0 ? z : tz === 1 ? 0 : 31)]];
   }
-  return this.blockIDs[this.blocks[Chunk.posToIndex(x, y, z)]];
+  return this.blockKeys[this.blocks[Chunk.posToIndex(x, y, z)]];
 };
 
 // getBlockType but gets more data { type, chunk object, x, y, z, index }
@@ -1471,10 +1928,10 @@ Chunk.prototype.getBlockData = function(x, y, z) {
     if (chunk === undefined) return undefined;
     let pos = [ tx === 0 ? x : tx === 1 ? 0 : 31, ty === 0 ? y : ty === 1 ? 0 : 31, tz === 0 ? z : tz === 1 ? 0 : 31 ],
         index = Chunk.posToIndex(...pos);
-    return { type: this.blockIDs[chunk.blocks[index]], id: chunk.blocks[index], chunk: chunk, chunkPos: chunkPos, x: pos[0], y: pos[1], z: pos[2], index: index };
+    return { type: this.blockKeys[chunk.blocks[index]], id: chunk.blocks[index], chunk: chunk, chunkPos: chunkPos, x: pos[0], y: pos[1], z: pos[2], index: index };
   }
   let index = Chunk.posToIndex(x, y, z);
-  return { type: this.blockIDs[this.blocks[index]], chunk: this, chunkPos: chunkPos, x: x, y: y, z: z, index: index };
+  return { type: this.blockKeys[this.blocks[index]], chunk: this, chunkPos: chunkPos, x: x, y: y, z: z, index: index };
 };
 
 Chunk.prototype.setBlock = function(x, y, z, block, data) {
@@ -1484,56 +1941,182 @@ Chunk.prototype.setBlock = function(x, y, z, block, data) {
 
 /** ./src/server/world/generator.js **/
 
-function Generator(seed) {
-  this.seed = seed;
-  this.noise = new SimplexNoise(new Alea(seed));
-};
-
-Generator.prototype.height = function(x, z) {
-  let a = (this.noise.noise2D(x / 100, z / 100) + 1) * 0.5 * 10;
-  let b = (this.noise.noise2D(x / 40, (z + 10000) / 40) + 1) * 0.5 * 10;
+const Generator = (function() {
   
-  let c = a * 10;
-  if (c > 70) {
-    c -= 75;
-    c += (this.noise.noise2D(x / 10, z / 10) + 1) * 0.5 * 8;
-    c *= 1.5;
-    if (c < 0) c = 0;
-  }
-  else c = 0;
-  
-  return Math.floor(a + b + c);
-};
-
-Generator.prototype.generateChunk = function(x, y, z) {
-  const blocks = new Uint16Array(32 * 32 * 32),
-        noiseMap = [];
-  // generate noise map for chunk
-  let nx, nz;
-  for (nx = 0; nx < 32; nx ++) {
-    noiseMap.push([]);
-    for (nz = 0; nz < 32; nz ++) {
-      noiseMap[nx].push(this.height(nx + x * 32, nz + z * 32));
+  function make3DArray(x0, y0, x1, y1) {
+    let out = [];
+    for (let x = x0; x < x1; x ++) {
+      out[x] = [];
+      for (let y = y0; y < y1; y ++) {
+        out[x][y] = [];
+      }
     }
+    return out;
   }
-  // fill blocks
-  for (let i = 0; i < 32 * 32 * 32; i ++) {
-    let p = Chunk.indexToPos(i);
-    let height = noiseMap[p[0]][p[2]];
-    let bheight = p[1] + y * 32;
-    //blocks[i] = p[0] >= 8 && p[0] < 24 && p[1] === 1 && p[2] >= 8 && p[2] < 24 ? ((p[0] + p[1] + p[2]) % 2 === 0 ? 7 : 9) : 0;
-    //blocks[i] = p[0] >= 8 && p[0] < 24 && p[1] >= 8 && p[1] < 24 && p[2] >= 8 && p[2] < 24 ? ((p[0] + p[1] + p[2]) % 2 === 0 ? 7 : 9) : 0;
-    blocks[i] = (bheight < height - 2) ? 1 : (bheight < height - 1) ? (Math.random() < 0.3 ? 1 : 2) : (bheight < height) ? 2 : (bheight === height) ? 3 : 0;
-  }
-  /*
-  for (let i = 0; i < 32 * 32 * 32; i ++) {
-    let p = Chunk.indexToPos(i);
-    blocks.push(p[1] + y * 32 < (10 + ((x + z) * 7) % 10) ? 1 : 0);
-  }*/
-  
-  return blocks;
-};
 
+  function Generator(seed, blockIDS) {
+    this.seed = seed;
+    this.noise = new SimplexNoise(new Alea(seed));
+
+    this.blockIDs = blockIDS;
+  };
+
+  Generator.prototype.generateCube = function(blocks, block, x, y, z, w, h, l, replace = false) {
+    block = this.blockIDs[block];
+    if (replace) replace = this.blockIDs[replace];
+
+    let px, py, pz;
+    for (px = x; px < x + w; px ++) {
+      if (px < 0) continue;
+      if (px > 31) break;
+      for (py = y; py < y + h; py ++) {
+        if (py < 0) continue;
+        if (py > 31) break;
+        for (pz = z; pz < z + l; pz ++) {
+          if (pz < 0) continue;
+          if (pz > 31) break;
+          if (replace === false || blocks[px][py][pz] === replace) blocks[px][py][pz] = block;
+        }
+      }
+    }
+  };
+
+  Generator.prototype.generateTree = function(blocks, x, y, z, rx, ry, rz) {
+    this.generateCube(blocks, 'log', x, y, z, 1, 3, 1);
+  };
+
+  Generator.prototype.generateChunk = function(x, y, z) {
+    const blockIDs = this.blockIDs,
+          blocks = [],
+          heightMap = [],
+          structureMap = [],
+          output = new Uint16Array(32 * 32 * 32);
+
+    // height map
+    for (let px = -2; px < 34; px ++) {
+      heightMap[px] = [];
+      for (let pz = -2; pz < 34; pz ++) {
+        let height = 0;
+
+        height = this.noise.noise2D((px + x * 32) / 300, (pz + z * 32) / 300) * 50 + 10;
+        height += this.noise.noise2D((px + x * 32) / 20, (pz + z * 32) / 20) * 10;
+        if (height < 0) height = 0;
+
+        heightMap[px][pz] = height;
+      }
+    }
+    
+    // structure map
+    for (let px = -2; px < 34; px ++) {
+      structureMap[px] = [];
+      for (let pz = -2; pz < 34; pz ++) {
+        let offset = this.noise.noise2D(Math.floor((px + x * 32 + 1000) / 10) * 10, Math.floor((pz + z * 32) / 10)) * 8;
+        structureMap[px][pz] = this.noise.noise2D(Math.floor((px + x * 32 + offset) / 10) * 10, Math.floor((pz + z * 32 + offset) / 10) * 10) > 0.8;
+      }
+    }
+    
+    // jungle structure generation
+    for (let px = -2; px < 34; px ++) {
+      blocks[px] = [];
+      for (let py = -2; py < 35; py ++) {
+        blocks[px][py] = [];
+        for (let pz = -2; pz < 34; pz ++) {
+          blocks[px][py][pz] = ((y + px) % 3 === 0 || (py + Math.floor(heightMap[0][0] * 2)) % 4 === 0 || (y + pz) % 3 === 0) && this.noise.noise3D(px + x * 32, py + y * 32, pz + z * 32) > -0.4 && (structureMap[px][pz] && (py + y * 32) < heightMap[Math.floor((px + 2) / 7)][Math.floor((pz + 2) / 7)] + 20) ? (py + y * 32 < heightMap[px][pz] + 5 ? (py + y * 32 < heightMap[px][pz] - 5 ? blockIDs.jungle_marble : blockIDs.tainted_marble) : blockIDs.marble) : blockIDs.air;
+        }
+      }
+    }
+    
+    // stone and water
+    for (let px = -2; px < 34; px ++) {
+      //blocks[px] = [];
+      for (let py = -2; py < 35; py ++) {
+        //blocks[px][py] = [];
+        for (let pz = -2; pz < 34; pz ++) {
+          let rx = px + x * 32;
+          let ry = py + y * 32;
+          let rz = pz + z * 32;
+          if (blocks[px][py][pz] === blockIDs.air) blocks[px][py][pz] = this.noise.noise3D(rx / 20, ry / 20, rz / 20) * 8 + this.noise.noise3D(rx / 50, ry / 50, rz / 50) * 15 + ry <= heightMap[px][pz] ? blockIDs.stone : blockIDs.air;
+          if (blocks[px][py][pz] === blockIDs.air && ry <= 0) blocks[px][py][pz] = blockIDs.water;
+        }
+      }
+    }
+
+    // grassing and sanding
+    for (let px = 0; px < 32; px ++) {
+      for (let pz = 0; pz < 32; pz ++) {
+        if (heightMap[px][pz] >= 30) continue;
+        for (let py = 0; py < 32; py ++) {
+          let rx = px + x * 32;
+          let ry = py + y * 32;
+          let rz = pz + z * 32;
+          if (blocks[px][py][pz] !== blockIDs.stone) continue;
+          
+          if (blocks[px + 1][py][pz] === blockIDs.water || blocks[px - 1][py][pz] === blockIDs.water || blocks[px][py + 1][pz] === blockIDs.water || blocks[px][py][pz + 1] === blockIDs.water || blocks[px][py][pz - 1] === blockIDs.water) {
+            blocks[px][py][pz] = blockIDs.sand;
+          } else if (blocks[px][py + 1][pz] === blockIDs.air) {
+            blocks[px][py][pz] = blockIDs.grass;
+          } else if (blocks[px][py + 2][pz] === blockIDs.air || blocks[px][py + 3][pz] === blockIDs.air) {
+            blocks[px][py][pz] = blockIDs.dirt;
+          }
+          
+          // sanding grass/dirt
+          if (blocks[px][py][pz] === blockIDs.grass || blocks[px][py][pz] === blockIDs.dirt) {
+            let sand = false;
+            for (let sx = -2; sx < 2; sx ++) {
+              for (let sy = -2; sy < 2; sy ++) {
+                for (let sz = -2; sz < 2; sz ++) {
+                  if (blocks[px + sx][py + sy][pz + sz] === blockIDs.water) {
+                    blocks[px][py][pz] = blockIDs.sand;
+                    sx = sy = sz = 2;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    // dirt downwards spreading into sand
+    for (let px = 0; px < 32; px ++) {
+      for (let pz = 0; pz < 32; pz ++) {
+        for (let py = 0; py < 32; py ++) {
+          if (blocks[px][py][pz] === blockIDs.sand && (blocks[px][py + 1][pz] === blockIDs.dirt || blocks[px][py + 1][pz] === blockIDs.grass || blocks[px][py + 2][pz] === blockIDs.dirt || blocks[px][py + 2][pz] === blockIDs.grass)) {
+            blocks[px][py][pz] = blockIDs.dirt;
+          }
+        }
+      }
+    }
+
+    // structures
+    for (let px = 0; px < 32; px ++) {
+      for (let py = 0; py < 32; py ++) {
+        for (let pz = 0; pz < 32; pz ++) {
+          let rx = px + x * 32;
+          let ry = py + y * 32;
+          let rz = pz + z * 32;
+          if (blocks[px][py - 1][pz] === blockIDs.grass) {
+            let chance = this.noise.noise3D(rx * 7, ry * 7, rz * 7);
+            if (chance > 0.86) this.generateTree(blocks, px, py, pz, rx, ry, rz);
+          }
+          if (blocks[px][py][pz] === blockIDs.marble) {
+            let chance = this.noise.noise3D(rx * 7, ry * 7, rz * 7);
+            if (chance > 0.86) this.generateCube(blocks, 'leaves', px - 1, py, pz - 1, 3, 2, 3, 'air');
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < 32 * 32 * 32; i ++) {
+      let pos = Chunk.indexToPos(i);
+      output[i] = blocks[pos[0]][pos[1]][pos[2]];
+    }
+    return output;
+  };
+  
+  return Generator;
+
+})();
 
 
 /** ./src/server/world/world.js **/
@@ -1541,17 +2124,17 @@ Generator.prototype.generateChunk = function(x, y, z) {
 // handles one world
 // one server may have multiple worlds running in parallel
 function World() {
+  this.blockKeys = Object.keys(Blocks);
+  this.blockIDs = Object.fromEntries(this.blockKeys.map((x, i) => [x, i]));
+  
   this.seed = Date.now();
-  this.generator = new Generator(this.seed);
+  this.generator = new Generator(this.seed, this.blockIDs);
   
   this.chunks = {};
   this.entities = {};
   
   this.player = undefined;
   this.playerID = undefined;
-  
-  this.blockIDs = Object.keys(Blocks);
-  this.blockKeys = Object.fromEntries(this.blockIDs.map((x, i) => [x, i]));;
 }
 
 // tick
@@ -1577,7 +2160,7 @@ World.prototype.tick = function() {
 World.prototype.generateChunk = function(x, y, z) {
   const c = x + ',' + y + ',' + z;
   if (this.chunks[c]) return;
-  this.chunks[c] = new Chunk(x, y, z, this.generator.generateChunk(x, y, z), this.blockIDs, this.chunks);
+  this.chunks[c] = new Chunk(x, y, z, this.generator.generateChunk(x, y, z), this.blockKeys, this.chunks);
 };
 
 // load saved chunk
@@ -1586,18 +2169,18 @@ World.prototype.loadChunk = function(x, y, z) {
 };
 
 World.prototype.setBlock = function(x, y, z, block, blockData = this.getBlockData(x, y, z)) {
-  if (this.blockKeys[block] === undefined) return -1;
-  blockData.chunk.blocks[blockData.index] = this.blockKeys[block];
+  if (this.blockIDs[block] === undefined) return -1;
+  blockData.chunk.blocks[blockData.index] = this.blockIDs[block];
 };
 
 // returns block type given the index (ID)
 World.prototype.blockType = function(index) {
-  return this.blockIDs[index];
+  return this.blockKeys[index];
 };
 
 // returns block ID given type
 World.prototype.blockID = function(type) {
-  return this.blockKeys[type];
+  return this.blockIDs[type];
 };
 
 // returns info of block from blockData given an index
@@ -1700,7 +2283,9 @@ function Sim() {
   this.server = true; // simulate everything
   this.client = true; // display and inputs
   
-  this.actions = ['draw', 'generateChunk', 'setBlock', 'spawnPlayer']
+  this.actions = ['draw', 'generateChunk', 'setBlock', 'spawnPlayer'];
+  
+  this.ticks = 0;
 }
 
 Sim.prototype.init = function() {
@@ -1759,5 +2344,6 @@ Sim.prototype.spawnPlayer = function(data) {
 
 Sim.prototype.tick = function() {
   this.world.tick();
+  this.ticks ++;
 };
 
