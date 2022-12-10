@@ -24,4 +24,5 @@ let getSrc = (dir) => new Promise(async (resolve, reject) => {
 (async function () {
   const src = await getSrc('./src/');
   fs.writeFileSync('./public/exolands.js', src);
+  console.log('wrote to src')
 })();

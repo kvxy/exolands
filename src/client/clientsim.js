@@ -1,4 +1,3 @@
-
 const ClientSim = {};
 
 ClientSim.init = function() {
@@ -16,4 +15,8 @@ ClientSim.generateChunk = function(x, y, z) {
 
 ClientSim.setBlock = function(x, y, z, block) {
   this.chunkGraphics.setBlock(x, y, z, block, prevBlockData); // prevBlockData FROM Sim
+};
+
+ClientSim.spawnPlayer = function(data) {
+  this.chunkGraphics.player = player;
 };

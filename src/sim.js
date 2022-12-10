@@ -1,10 +1,11 @@
-
 // Handles all in-game events
 function Sim() {
   this.server = true; // simulate everything
   this.client = true; // display and inputs
   
-  this.actions = ['draw', 'generateChunk', 'setBlock']
+  this.actions = ['draw', 'generateChunk', 'setBlock', 'spawnPlayer'];
+  
+  this.ticks = 0;
 }
 
 Sim.prototype.init = function() {
@@ -55,4 +56,13 @@ Sim.prototype.setBlock = function(x, y, z, block) {
   let prevBlockData = this.world.getBlockData(x, y, z);
   if (!prevBlockData) return;
   if (this.world.setBlock(x, y, z, block, prevBlockData) === -1) return;
+};
+
+Sim.prototype.spawnPlayer = function(data) {
+  let player = this.world.spawnPlayer(data);
+};
+
+Sim.prototype.tick = function() {
+  this.world.tick();
+  this.ticks ++;
 };
